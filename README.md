@@ -26,13 +26,13 @@ The default Python-based `gcloud compute start-iap-tunnel` command can be slow a
 
 ```bash
 
-git clone https://github.com/your-username/iap-proxy.git
+git clone https://github.com/mikewiacek/iapproxy.git
 
-cd iap-proxy
+cd iapproxy
 
 go mod tidy
 
-go build -o iap-proxy
+go build -o iapproxy
 
 ```
 
@@ -42,7 +42,7 @@ Copy the binary to a location in your PATH:
 
 ```bash
 
-sudo cp iap-proxy /usr/local/bin/
+sudo cp iapproxy /usr/local/bin/
 
 ```
 
@@ -53,10 +53,10 @@ sudo cp iap-proxy /usr/local/bin/
 ```bash
 
 # Direct usage (similar to gcloud compute start-iap-tunnel)
-iap-proxy --project=my-project --zone=us-central1-a my-instance 22
+iapproxy --project=my-project --zone=us-central1-a my-instance 22
 
 # For SSH ProxyCommand (stdin mode)
-iap-proxy --listen-on-stdin --project=my-project --zone=us-central1-a my-instance 22
+iapproxy --listen-on-stdin --project=my-project --zone=us-central1-a my-instance 22
 
 ```
 
@@ -72,7 +72,7 @@ Host my-gce-instance
   CheckHostIP no
   IdentitiesOnly yes
   UserKnownHostsFile ~/.ssh/google_compute_known_hosts
-  ProxyCommand iap-proxy --listen-on-stdin --project=my-project --zone=us-central1-a my-instance %p
+  ProxyCommand iapproxy --listen-on-stdin --project=my-project --zone=us-central1-a my-instance %p
   ProxyUseFdpass no
 ```
 
@@ -160,7 +160,7 @@ The tool uses Google's Application Default Credentials, which means it works if 
 
 # Test with debug logging
 
-iap-proxy --verbosity=debug --project=my-project --zone=us-central1-a my-instance 22
+iapproxy --verbosity=debug --project=my-project --zone=us-central1-a my-instance 22
 
 # Verify gcloud authentication
 
