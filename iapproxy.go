@@ -146,10 +146,17 @@ type Config struct {
 }
 
 type connectionStats struct {
-	bytesReceived int64
-	bytesSent     int64
-	connections   int64
-	reconnects    int64
+	bytesReceived    int64
+	bytesSent        int64
+	connections      int64
+	reconnects       int64
+	startTime        time.Time
+	tokenRefreshes   int64     // number of times tokens have been refreshed
+	wsConnections    int64     // total WebSocket connections made
+	wsErrors         int64     // WebSocket connection errors
+	localErrors      int64     // local connection errors
+	lastTokenRefresh time.Time // when token was last refreshed
+	lastReconnect    time.Time // when last reconnect happened
 }
 
 func (s *connectionStats) addReceived(bytes int64) {
@@ -164,11 +171,32 @@ func (s *connectionStats) addConnection() {
 	atomic.AddInt64(&s.connections, 1)
 }
 
+func (s *connectionStats) addTokenRefresh() {
+	atomic.AddInt64(&s.tokenRefreshes, 1)
+	s.lastTokenRefresh = time.Now()
+}
+
+func (s *connectionStats) addWSConnection() {
+	atomic.AddInt64(&s.wsConnections, 1)
+}
+
+func (s *connectionStats) addWSError() {
+	atomic.AddInt64(&s.wsErrors, 1)
+}
+
+func (s *connectionStats) addLocalError() {
+	atomic.AddInt64(&s.localErrors, 1)
+}
+
 func (s *connectionStats) addReconnect() {
 	atomic.AddInt64(&s.reconnects, 1)
+	s.lastReconnect = time.Now()
 }
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var config Config
 
 	flag.StringVar(&config.ProjectID, "project", "", "Google Cloud project ID")
@@ -199,21 +227,29 @@ func main() {
 		log.Fatal("Zone is required (use --zone flag)")
 	}
 
-	tunnel, err := NewIAPTunnel(config)
+	tunnel, err := NewIAPTunnel(ctx, config)
 	if err != nil {
 		log.Fatalf("Failed to create tunnel: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Graceful shutdown
+	// Graceful shutdown and stats dumping
 	sigChan := make(chan os.Signal, 1)
+	statsChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(statsChan, syscall.SIGUSR1)
+
 	go func() {
 		<-sigChan
 		tunnel.logDebug("Received shutdown signal")
 		cancel()
+	}()
+
+	// Handle SIGUSR1 for stats dumping
+	go func() {
+		for {
+			<-statsChan
+			tunnel.dumpStats()
+		}
 	}()
 
 	// Start statistics reporting if debug mode
@@ -239,9 +275,9 @@ type IAPTunnel struct {
 	logger             *log.Logger
 }
 
-func NewIAPTunnel(config Config) (*IAPTunnel, error) {
-	ctx := context.Background()
-
+// NewIAPTunnel creates a tunnel that we can use to pass traffic through IAP.
+// ctx is only used for the duration of NewIAPTunnel.
+func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 	tokenSource, err := google.DefaultTokenSource(ctx, iapScope)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token source: %w", err)
@@ -254,7 +290,7 @@ func NewIAPTunnel(config Config) (*IAPTunnel, error) {
 		config:      config,
 		client:      client,
 		tokenSource: tokenSource,
-		stats:       &connectionStats{},
+		stats:       &connectionStats{startTime: time.Now()},
 		logger:      log.New(os.Stderr, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
 	}
 	tunnel.connectCond = sync.NewCond(&tunnel.connectMutex)
@@ -459,6 +495,7 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 				return ws, nil
 			}
 
+			t.stats.addWSError()
 			lastErr = err
 			t.logError("WebSocket connection attempt %d failed: %v", attempt, err)
 
@@ -502,6 +539,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 				if err != nil {
 					if !isExpectedCloseError(err) {
 						t.logError("WebSocket read error: %v", err)
+						t.stats.addWSError()
 						errChan <- err
 					}
 					return
@@ -515,6 +553,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 						_, err := writer.Write(extractedData)
 						if err != nil {
 							t.logError("Local write error: %v", err)
+							t.stats.addLocalError()
 							errChan <- err
 							return
 						}
@@ -543,6 +582,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 				}
 				if err != nil {
 					t.logError("Local read error: %v", err)
+					t.stats.addLocalError()
 					errChan <- err
 					return
 				}
@@ -557,6 +597,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 
 					if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 						t.logError("WebSocket write error: %v", err)
+						t.stats.addWSError()
 						errChan <- err
 						return
 					}
@@ -602,6 +643,7 @@ func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, erro
 			if err != nil {
 				return nil, fmt.Errorf("failed to refresh token: %w", err)
 			}
+			t.stats.addTokenRefresh()
 		}
 	}
 
@@ -709,6 +751,69 @@ func (t *IAPTunnel) createSubprotocolDataFrame(data []byte) []byte {
 	binary.BigEndian.PutUint32(frame[2:6], uint32(len(data)))
 	copy(frame[6:], data)
 	return frame
+}
+
+func (t *IAPTunnel) dumpStats() {
+	uptime := time.Since(t.stats.startTime)
+	received := atomic.LoadInt64(&t.stats.bytesReceived)
+	sent := atomic.LoadInt64(&t.stats.bytesSent)
+	connections := atomic.LoadInt64(&t.stats.connections)
+	reconnects := atomic.LoadInt64(&t.stats.reconnects)
+	tokenRefreshes := atomic.LoadInt64(&t.stats.tokenRefreshes)
+	wsConnections := atomic.LoadInt64(&t.stats.wsConnections)
+	wsErrors := atomic.LoadInt64(&t.stats.wsErrors)
+	localErrors := atomic.LoadInt64(&t.stats.localErrors)
+
+	fmt.Fprintf(os.Stderr, "\n=== IAP Tunnel Statistics ===\n")
+	fmt.Fprintf(os.Stderr, "Runtime:\n")
+	fmt.Fprintf(os.Stderr, "  Uptime: %v\n", uptime.Round(time.Second))
+	fmt.Fprintf(os.Stderr, "  Started: %s\n", t.stats.startTime.Format("2006-01-02 15:04:05"))
+
+	fmt.Fprintf(os.Stderr, "\nData Transfer:\n")
+	fmt.Fprintf(os.Stderr, "  Bytes received: %d (%.2f MB)\n", received, float64(received)/(1024*1024))
+	fmt.Fprintf(os.Stderr, "  Bytes sent: %d (%.2f MB)\n", sent, float64(sent)/(1024*1024))
+	fmt.Fprintf(os.Stderr, "  Total bytes: %d (%.2f MB)\n", received+sent, float64(received+sent)/(1024*1024))
+
+	if uptime.Seconds() > 0 {
+		fmt.Fprintf(os.Stderr, "  Avg throughput: %.2f KB/s in, %.2f KB/s out\n",
+			float64(received)/uptime.Seconds()/1024,
+			float64(sent)/uptime.Seconds()/1024)
+	}
+
+	fmt.Fprintf(os.Stderr, "\nConnections:\n")
+	fmt.Fprintf(os.Stderr, "  Local connections: %d\n", connections)
+	fmt.Fprintf(os.Stderr, "  WebSocket connections: %d\n", wsConnections)
+	fmt.Fprintf(os.Stderr, "  Reconnects: %d\n", reconnects)
+	if !t.stats.lastReconnect.IsZero() {
+		fmt.Fprintf(os.Stderr, "  Last reconnect: %s (%v ago)\n",
+			t.stats.lastReconnect.Format("15:04:05"),
+			time.Since(t.stats.lastReconnect).Round(time.Second))
+	}
+
+	fmt.Fprintf(os.Stderr, "\nAuthentication:\n")
+	fmt.Fprintf(os.Stderr, "  Token refreshes: %d\n", tokenRefreshes)
+	if !t.stats.lastTokenRefresh.IsZero() {
+		fmt.Fprintf(os.Stderr, "  Last token refresh: %s (%v ago)\n",
+			t.stats.lastTokenRefresh.Format("15:04:05"),
+			time.Since(t.stats.lastTokenRefresh).Round(time.Second))
+	}
+
+	fmt.Fprintf(os.Stderr, "\nErrors:\n")
+	fmt.Fprintf(os.Stderr, "  WebSocket errors: %d\n", wsErrors)
+	fmt.Fprintf(os.Stderr, "  Local connection errors: %d\n", localErrors)
+
+	// Connection quality metrics
+	if wsConnections > 0 {
+		errorRate := float64(wsErrors) / float64(wsConnections) * 100
+		fmt.Fprintf(os.Stderr, "  WebSocket error rate: %.1f%%\n", errorRate)
+	}
+
+	if connections > 0 {
+		reconnectRate := float64(reconnects) / float64(connections) * 100
+		fmt.Fprintf(os.Stderr, "  Reconnect rate: %.1f%%\n", reconnectRate)
+	}
+
+	fmt.Fprintf(os.Stderr, "=============================\n\n")
 }
 
 func isExpectedCloseError(err error) bool {
