@@ -126,12 +126,14 @@ const (
 	maxFrameSize    = 16 * 1024 // 16KB max frame size (matches Python SUBPROTOCOL_MAX_DATA_FRAME_SIZE)
 
 	// Connection management
-	maxRetries         = 3
-	retryBackoff       = 1 * time.Second
-	connectionTimeout  = 30 * time.Second
-	writeTimeout       = 10 * time.Second
-	readTimeout        = 60 * time.Second
-	tokenRefreshBuffer = 5 * time.Minute // Refresh token 5 minutes before expiry
+	maxRetries          = 3
+	retryBackoff        = 1 * time.Second
+	connectionTimeout   = 30 * time.Second
+	writeTimeout        = 10 * time.Second
+	readTimeout         = 60 * time.Second
+	tokenRefreshBuffer  = 5 * time.Minute  // Refresh token 5 minutes before expiry
+	healthCheckInterval = 30 * time.Second // Check connection health
+	maxIdleTime         = 5 * time.Minute  // Max time without data transfer
 )
 
 type Config struct {
@@ -157,6 +159,9 @@ type connectionStats struct {
 	localErrors      int64     // local connection errors
 	lastTokenRefresh time.Time // when token was last refreshed
 	lastReconnect    time.Time // when last reconnect happened
+	lastActivity     time.Time // Last time data was transferred
+	healthChecks     int64     // Number of health checks performed
+	idleTimeouts     int64     // Number of idle timeouts
 }
 
 func (s *connectionStats) addReceived(bytes int64) {
@@ -191,6 +196,18 @@ func (s *connectionStats) addLocalError() {
 func (s *connectionStats) addReconnect() {
 	atomic.AddInt64(&s.reconnects, 1)
 	s.lastReconnect = time.Now()
+}
+
+func (s *connectionStats) updateActivity() {
+	s.lastActivity = time.Now()
+}
+
+func (s *connectionStats) addHealthCheck() {
+	atomic.AddInt64(&s.healthChecks, 1)
+}
+
+func (s *connectionStats) addIdleTimeout() {
+	atomic.AddInt64(&s.idleTimeouts, 1)
 }
 
 func main() {
@@ -272,6 +289,7 @@ type IAPTunnel struct {
 	connectMutex       sync.RWMutex
 	connectCond        *sync.Cond
 	stats              *connectionStats
+	activeConnections  sync.Map
 	logger             *log.Logger
 }
 
@@ -290,7 +308,7 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 		config:      config,
 		client:      client,
 		tokenSource: tokenSource,
-		stats:       &connectionStats{startTime: time.Now()},
+		stats:       &connectionStats{startTime: time.Now(), lastActivity: time.Now()},
 		logger:      log.New(os.Stderr, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
 	}
 	tunnel.connectCond = sync.NewCond(&tunnel.connectMutex)
@@ -376,7 +394,14 @@ func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
 				return fmt.Errorf("failed to connect to IAP: %w", err)
 			}
 
+			// Reset connection state
+			t.setConnected(false)
+
 			err = t.handleBidirectionalTransfer(ctx, ws, os.Stdin, os.Stdout)
+
+			// Clean shutdown of WebSocket
+			ws.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			ws.Close()
 
 			if err == context.Canceled || err == context.DeadlineExceeded {
@@ -384,9 +409,8 @@ func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
 			}
 
 			t.logError("Connection lost, retrying: %v", err)
-			t.setConnected(false)
 
-			// Brief delay before retry
+			// Brief delay before retry to let things settle
 			select {
 			case <-time.After(retryBackoff):
 			case <-ctx.Done():
@@ -516,6 +540,10 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 
 // Production-grade bidirectional transfer - matches Python behavior exactly
 func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websocket.Conn, reader io.Reader, writer io.Writer) error {
+	// Create a context that we can cancel when we detect errors
+	transferCtx, transferCancel := context.WithCancel(ctx)
+	defer transferCancel()
+
 	// No ping/pong - removed completely as Python implementation rejects it
 	// No batching - send frames immediately like Python implementation
 
@@ -524,12 +552,16 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	// WebSocket message reader
 	go func() {
 		defer func() {
+			transferCancel()
 			errChan <- nil
 		}()
 
+		consecutiveErrors := 0
+		const maxConsecutiveErrors = 3
+
 		for {
 			select {
-			case <-ctx.Done():
+			case <-transferCtx.Done():
 				return
 			default:
 				// Set read timeout
@@ -537,19 +569,39 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 
 				messageType, data, err := ws.ReadMessage()
 				if err != nil {
+					consecutiveErrors++
+					if consecutiveErrors >= maxConsecutiveErrors {
+						t.logError("Too many consecutive read errors (%d), forcing reconnect", consecutiveErrors)
+						errChan <- fmt.Errorf("consecutive error threshold exceeded")
+						return
+					}
+
 					if !isExpectedCloseError(err) {
-						t.logError("WebSocket read error: %v", err)
+						t.logError("WebSocket read error #%d: %v", consecutiveErrors, err)
 						t.stats.addWSError()
-						errChan <- err
+						// Small delay before retry to prevent tight error loops
+						time.Sleep(100 * time.Millisecond)
+
+						// Don't return immediately, try to recover
+						continue
 					}
 					return
 				}
 
+				// Reset error counter on successful read
+				consecutiveErrors = 0
+
 				if messageType == websocket.BinaryMessage {
 					if extractedData := t.extractDataFromWebSocketMessage(data); extractedData != nil {
 						t.stats.addReceived(int64(len(extractedData)))
+						t.stats.updateActivity()
 
-						// Write immediately to local connection - no buffering like Python
+						// Write with timeout and proper error handling
+						if netConn, ok := writer.(net.Conn); ok {
+							netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
+						}
+
+						// Write immediately to local connection
 						_, err := writer.Write(extractedData)
 						if err != nil {
 							t.logError("Local write error: %v", err)
@@ -566,6 +618,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	// Local reader to WebSocket writer
 	go func() {
 		defer func() {
+			transferCancel()
 			errChan <- nil
 		}()
 
@@ -573,14 +626,24 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-transferCtx.Done():
 				return
 			default:
+				// Set read timeout for local connection
+				if netConn, ok := reader.(net.Conn); ok {
+					netConn.SetReadDeadline(time.Now().Add(readTimeout))
+				}
+
 				n, err := reader.Read(buffer)
 				if err == io.EOF {
+					t.logDebug("Local connection closed (EOF)")
 					return
 				}
 				if err != nil {
+					// Don't treat timeout as fatal error
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
 					t.logError("Local read error: %v", err)
 					t.stats.addLocalError()
 					errChan <- err
@@ -603,13 +666,50 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 					}
 
 					t.stats.addSent(int64(n))
+					t.stats.updateActivity()
 				}
 			}
 		}
 	}()
 
+	go func() {
+		defer func() { errChan <- nil }()
+
+		ticker := time.NewTicker(healthCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				t.stats.addHealthCheck()
+
+				// Check for idle connection
+				if time.Since(t.stats.lastActivity) > maxIdleTime {
+					t.logError("Connection idle for %v, forcing reconnect", time.Since(t.stats.lastActivity))
+					t.stats.addIdleTimeout()
+					errChan <- fmt.Errorf("idle timeout")
+					return
+				}
+
+				// Try to detect if WebSocket is still responsive
+				// We can't send ping (IAP rejects it), but we can check if socket is still writable
+				ws.SetWriteDeadline(time.Now().Add(1 * time.Second))
+				if err := ws.WriteMessage(websocket.BinaryMessage, []byte{}); err != nil {
+					t.logError("Health check failed: %v", err)
+					errChan <- fmt.Errorf("health check failed: %w", err)
+					return
+				}
+
+				t.logDebug("Health check passed")
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Wait for connection to be established
-	if err := t.waitForConnection(ctx); err != nil {
+	if err := t.waitForConnection(transferCtx); err != nil {
 		return err
 	}
 
@@ -618,12 +718,14 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	// Wait for first error or context cancellation
 	select {
 	case err := <-errChan:
+		// Give a moment for other goroutines to clean up
+		time.Sleep(50 * time.Millisecond)
 		if err != nil {
 			return err
 		}
 		return fmt.Errorf("connection closed")
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-transferCtx.Done():
+		return transferCtx.Err()
 	}
 }
 
@@ -763,57 +865,77 @@ func (t *IAPTunnel) dumpStats() {
 	wsConnections := atomic.LoadInt64(&t.stats.wsConnections)
 	wsErrors := atomic.LoadInt64(&t.stats.wsErrors)
 	localErrors := atomic.LoadInt64(&t.stats.localErrors)
+	healthChecks := atomic.LoadInt64(&t.stats.healthChecks)
+	idleTimeouts := atomic.LoadInt64(&t.stats.idleTimeouts)
 
-	fmt.Fprintf(os.Stderr, "\n=== IAP Tunnel Statistics ===\n")
-	fmt.Fprintf(os.Stderr, "Runtime:\n")
-	fmt.Fprintf(os.Stderr, "  Uptime: %v\n", uptime.Round(time.Second))
-	fmt.Fprintf(os.Stderr, "  Started: %s\n", t.stats.startTime.Format("2006-01-02 15:04:05"))
+	// Create a single buffer for all output to avoid interleaving
+	var buf strings.Builder
 
-	fmt.Fprintf(os.Stderr, "\nData Transfer:\n")
-	fmt.Fprintf(os.Stderr, "  Bytes received: %d (%.2f MB)\n", received, float64(received)/(1024*1024))
-	fmt.Fprintf(os.Stderr, "  Bytes sent: %d (%.2f MB)\n", sent, float64(sent)/(1024*1024))
-	fmt.Fprintf(os.Stderr, "  Total bytes: %d (%.2f MB)\n", received+sent, float64(received+sent)/(1024*1024))
+	buf.WriteString("\n=== IAP Tunnel Statistics ===\n")
+	buf.WriteString(fmt.Sprintf("Runtime:\n"))
+	buf.WriteString(fmt.Sprintf("  Uptime: %v\n", uptime.Round(time.Second)))
+	buf.WriteString(fmt.Sprintf("  Started: %s\n", t.stats.startTime.Format("2006-01-02 15:04:05")))
+
+	buf.WriteString(fmt.Sprintf("\nData Transfer:\n"))
+	buf.WriteString(fmt.Sprintf("  Bytes received: %d (%.2f MB)\n", received, float64(received)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Bytes sent: %d (%.2f MB)\n", sent, float64(sent)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Total bytes: %d (%.2f MB)\n", received+sent, float64(received+sent)/(1024*1024)))
 
 	if uptime.Seconds() > 0 {
-		fmt.Fprintf(os.Stderr, "  Avg throughput: %.2f KB/s in, %.2f KB/s out\n",
+		buf.WriteString(fmt.Sprintf("  Avg throughput: %.2f KB/s in, %.2f KB/s out\n",
 			float64(received)/uptime.Seconds()/1024,
-			float64(sent)/uptime.Seconds()/1024)
+			float64(sent)/uptime.Seconds()/1024))
 	}
 
-	fmt.Fprintf(os.Stderr, "\nConnections:\n")
-	fmt.Fprintf(os.Stderr, "  Local connections: %d\n", connections)
-	fmt.Fprintf(os.Stderr, "  WebSocket connections: %d\n", wsConnections)
-	fmt.Fprintf(os.Stderr, "  Reconnects: %d\n", reconnects)
+	buf.WriteString(fmt.Sprintf("\nConnections:\n"))
+	buf.WriteString(fmt.Sprintf("  Local connections: %d\n", connections))
+	buf.WriteString(fmt.Sprintf("  WebSocket connections: %d\n", wsConnections))
+	buf.WriteString(fmt.Sprintf("  Reconnects: %d\n", reconnects))
 	if !t.stats.lastReconnect.IsZero() {
-		fmt.Fprintf(os.Stderr, "  Last reconnect: %s (%v ago)\n",
+		buf.WriteString(fmt.Sprintf("  Last reconnect: %s (%v ago)\n",
 			t.stats.lastReconnect.Format("15:04:05"),
-			time.Since(t.stats.lastReconnect).Round(time.Second))
+			time.Since(t.stats.lastReconnect).Round(time.Second)))
 	}
 
-	fmt.Fprintf(os.Stderr, "\nAuthentication:\n")
-	fmt.Fprintf(os.Stderr, "  Token refreshes: %d\n", tokenRefreshes)
+	buf.WriteString(fmt.Sprintf("\nAuthentication:\n"))
+	buf.WriteString(fmt.Sprintf("  Token refreshes: %d\n", tokenRefreshes))
 	if !t.stats.lastTokenRefresh.IsZero() {
-		fmt.Fprintf(os.Stderr, "  Last token refresh: %s (%v ago)\n",
+		buf.WriteString(fmt.Sprintf("  Last token refresh: %s (%v ago)\n",
 			t.stats.lastTokenRefresh.Format("15:04:05"),
-			time.Since(t.stats.lastTokenRefresh).Round(time.Second))
+			time.Since(t.stats.lastTokenRefresh).Round(time.Second)))
 	}
 
-	fmt.Fprintf(os.Stderr, "\nErrors:\n")
-	fmt.Fprintf(os.Stderr, "  WebSocket errors: %d\n", wsErrors)
-	fmt.Fprintf(os.Stderr, "  Local connection errors: %d\n", localErrors)
+	buf.WriteString(fmt.Sprintf("\nErrors:\n"))
+	buf.WriteString(fmt.Sprintf("  WebSocket errors: %d\n", wsErrors))
+	buf.WriteString(fmt.Sprintf("  Local connection errors: %d\n", localErrors))
 
 	// Connection quality metrics
 	if wsConnections > 0 {
 		errorRate := float64(wsErrors) / float64(wsConnections) * 100
-		fmt.Fprintf(os.Stderr, "  WebSocket error rate: %.1f%%\n", errorRate)
+		buf.WriteString(fmt.Sprintf("  WebSocket error rate: %.1f%%\n", errorRate))
 	}
 
 	if connections > 0 {
 		reconnectRate := float64(reconnects) / float64(connections) * 100
-		fmt.Fprintf(os.Stderr, "  Reconnect rate: %.1f%%\n", reconnectRate)
+		buf.WriteString(fmt.Sprintf("  Reconnect rate: %.1f%%\n", reconnectRate))
 	}
 
-	fmt.Fprintf(os.Stderr, "=============================\n\n")
+	buf.WriteString(fmt.Sprintf("\nHealth Monitoring:\n"))
+	buf.WriteString(fmt.Sprintf("  Health checks: %d\n", healthChecks))
+	buf.WriteString(fmt.Sprintf("  Idle timeouts: %d\n", idleTimeouts))
+	if !t.stats.lastActivity.IsZero() {
+		buf.WriteString(fmt.Sprintf("  Last activity: %s (%v ago)\n",
+			t.stats.lastActivity.Format("15:04:05"),
+			time.Since(t.stats.lastActivity).Round(time.Second)))
+	}
+
+	buf.WriteString("=============================\n\n")
+
+	// Write everything at once to avoid interleaving with shell output
+	fmt.Fprint(os.Stderr, buf.String())
+
+	// Force flush stderr
+	os.Stderr.Sync()
 }
 
 func isExpectedCloseError(err error) bool {
@@ -822,5 +944,7 @@ func isExpectedCloseError(err error) bool {
 		websocket.CloseGoingAway,
 		websocket.CloseAbnormalClosure,
 		websocket.CloseNoStatusReceived,
+		4080, // IAP "error while receiving from client"
+		4004, // IAP "reauthentication required"
 	)
 }
