@@ -126,14 +126,16 @@ const (
 	maxFrameSize    = 16 * 1024 // 16KB max frame size (matches Python SUBPROTOCOL_MAX_DATA_FRAME_SIZE)
 
 	// Connection management
-	maxRetries          = 3
-	retryBackoff        = 1 * time.Second
-	connectionTimeout   = 30 * time.Second
-	writeTimeout        = 10 * time.Second
-	readTimeout         = 60 * time.Second
-	tokenRefreshBuffer  = 5 * time.Minute  // Refresh token 5 minutes before expiry
-	healthCheckInterval = 30 * time.Second // Check connection health
-	maxIdleTime         = 5 * time.Minute  // Max time without data transfer
+	maxRetries               = 3
+	retryBackoff             = 1 * time.Second
+	connectionTimeout        = 30 * time.Second
+	writeTimeout             = 10 * time.Second
+	readTimeout              = 60 * time.Second
+	tokenRefreshBuffer       = 5 * time.Minute  // Refresh token 5 minutes before expiry
+	healthCheckInterval      = 30 * time.Second // Check connection health
+	maxIdleTime              = 5 * time.Minute  // Max time without data transfer
+	localHealthCheckInterval = 5 * time.Second  // Check local connection health
+	maxLocalReadTimeout      = 30 * time.Second // Max time to wait for local read
 )
 
 type Config struct {
@@ -145,6 +147,7 @@ type Config struct {
 	LocalHost     string
 	Verbosity     string
 	ListenOnStdin bool
+	LogFile       string
 }
 
 type connectionStats struct {
@@ -222,6 +225,7 @@ func main() {
 	flag.StringVar(&config.LocalHost, "local-host", "127.0.0.1", "Local host to bind to")
 	flag.StringVar(&config.Verbosity, "verbosity", "warning", "Verbosity level (debug, info, warning, error)")
 	flag.BoolVar(&config.ListenOnStdin, "listen-on-stdin", false, "Listen on stdin instead of creating local port")
+	flag.StringVar(&config.LogFile, "log-file", "", "Log file path (default: stderr)")
 
 	flag.Parse()
 
@@ -301,6 +305,15 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 		return nil, fmt.Errorf("failed to get token source: %w", err)
 	}
 
+	var logWriter io.Writer = os.Stderr
+	if config.LogFile != "" {
+		f, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open log file: %w", err)
+		}
+		logWriter = f
+	}
+
 	client := oauth2.NewClient(ctx, tokenSource)
 	client.Timeout = connectionTimeout
 
@@ -309,7 +322,7 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 		client:      client,
 		tokenSource: tokenSource,
 		stats:       &connectionStats{startTime: time.Now(), lastActivity: time.Now()},
-		logger:      log.New(os.Stderr, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
+		logger:      log.New(logWriter, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
 	}
 	tunnel.connectCond = sync.NewCond(&tunnel.connectMutex)
 
@@ -550,26 +563,56 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	errChan := make(chan error, 4)
 
 	// WebSocket message reader
+	// WebSocket message reader with enhanced monitoring
 	go func() {
 		defer func() {
+			t.logDebug("WebSocket reader goroutine exiting")
 			transferCancel()
 			errChan <- nil
 		}()
 
 		consecutiveErrors := 0
 		const maxConsecutiveErrors = 3
+		lastRemoteActivity := time.Now()
+
+		// Monitor for remote activity
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					// If we haven't seen remote activity in a while, that might be normal
+					// But log it for debugging
+					timeSinceRemote := time.Since(lastRemoteActivity)
+					if timeSinceRemote > 2*time.Minute {
+						t.logDebug("No remote activity for %v (might be normal)", timeSinceRemote)
+					}
+
+				case <-transferCtx.Done():
+					return
+				}
+			}
+		}()
 
 		for {
 			select {
 			case <-transferCtx.Done():
 				return
 			default:
-				// Set read timeout
 				ws.SetReadDeadline(time.Now().Add(readTimeout))
 
 				messageType, data, err := ws.ReadMessage()
 				if err != nil {
 					consecutiveErrors++
+
+					if websocket.IsCloseError(err, 4080, 4004) {
+						t.logError("IAP connection error (code in close): %v", err)
+						errChan <- fmt.Errorf("IAP connection error: %w", err)
+						return
+					}
+
 					if consecutiveErrors >= maxConsecutiveErrors {
 						t.logError("Too many consecutive read errors (%d), forcing reconnect", consecutiveErrors)
 						errChan <- fmt.Errorf("consecutive error threshold exceeded")
@@ -579,29 +622,27 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 					if !isExpectedCloseError(err) {
 						t.logError("WebSocket read error #%d: %v", consecutiveErrors, err)
 						t.stats.addWSError()
-						// Small delay before retry to prevent tight error loops
 						time.Sleep(100 * time.Millisecond)
-
-						// Don't return immediately, try to recover
 						continue
 					}
 					return
 				}
 
-				// Reset error counter on successful read
 				consecutiveErrors = 0
+				lastRemoteActivity = time.Now()
 
 				if messageType == websocket.BinaryMessage {
 					if extractedData := t.extractDataFromWebSocketMessage(data); extractedData != nil {
 						t.stats.addReceived(int64(len(extractedData)))
 						t.stats.updateActivity()
 
+						t.logDebug("Received %d bytes from WebSocket", len(extractedData))
+
 						// Write with timeout and proper error handling
 						if netConn, ok := writer.(net.Conn); ok {
 							netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 						}
 
-						// Write immediately to local connection
 						_, err := writer.Write(extractedData)
 						if err != nil {
 							t.logError("Local write error: %v", err)
@@ -616,32 +657,80 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	}()
 
 	// Local reader to WebSocket writer
+	// Local reader to WebSocket writer with bidirectional health monitoring
 	go func() {
 		defer func() {
+			t.logDebug("Local reader goroutine exiting")
 			transferCancel()
 			errChan <- nil
 		}()
 
-		buffer := make([]byte, maxFrameSize) // Use Python's max frame size
+		buffer := make([]byte, maxFrameSize)
+		lastLocalActivity := time.Now()
+
+		// Health monitoring for local connection
+		go func() {
+			ticker := time.NewTicker(localHealthCheckInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					// Check if local connection has been quiet too long
+					if time.Since(lastLocalActivity) > maxLocalReadTimeout {
+						// Try a non-blocking read to test if connection is still alive
+						if netConn, ok := reader.(net.Conn); ok {
+							netConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+							testBuf := make([]byte, 1)
+							n, err := netConn.Read(testBuf)
+
+							if err != nil && !isTimeoutError(err) {
+								t.logError("Local connection health check failed: %v", err)
+								transferCancel()
+								return
+							}
+
+							// If we read a byte, we need to handle it
+							if n > 0 {
+								// Process the byte we just read
+								frame := t.createSubprotocolDataFrame(testBuf[:n])
+								ws.SetWriteDeadline(time.Now().Add(writeTimeout))
+								if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+									t.logError("WebSocket write error during health check: %v", err)
+									transferCancel()
+									return
+								}
+								t.stats.addSent(1)
+								t.stats.updateActivity()
+								lastLocalActivity = time.Now()
+							}
+
+							// Reset to blocking mode
+							netConn.SetReadDeadline(time.Time{})
+						}
+					}
+
+				case <-transferCtx.Done():
+					return
+				}
+			}
+		}()
 
 		for {
 			select {
 			case <-transferCtx.Done():
 				return
 			default:
-				// Set read timeout for local connection
-				if netConn, ok := reader.(net.Conn); ok {
-					netConn.SetReadDeadline(time.Now().Add(readTimeout))
-				}
-
+				// Don't set a read deadline here - let the health monitor handle timeouts
 				n, err := reader.Read(buffer)
 				if err == io.EOF {
 					t.logDebug("Local connection closed (EOF)")
 					return
 				}
 				if err != nil {
-					// Don't treat timeout as fatal error
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if isTimeoutError(err) {
+						// Update last activity time even for timeouts
+						lastLocalActivity = time.Now()
 						continue
 					}
 					t.logError("Local read error: %v", err)
@@ -650,8 +739,9 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 					return
 				}
 
+				lastLocalActivity = time.Now()
+
 				if n > 0 {
-					// Create frame and send immediately - no batching like Python
 					data := make([]byte, n)
 					copy(data, buffer[:n])
 
@@ -667,6 +757,7 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 
 					t.stats.addSent(int64(n))
 					t.stats.updateActivity()
+					t.logDebug("Sent %d bytes to WebSocket", n)
 				}
 			}
 		}
@@ -683,26 +774,19 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 			case <-ticker.C:
 				t.stats.addHealthCheck()
 
-				// Check for idle connection
-				if time.Since(t.stats.lastActivity) > maxIdleTime {
-					t.logError("Connection idle for %v, forcing reconnect", time.Since(t.stats.lastActivity))
+				// Passive check - only look at activity, don't send anything
+				timeSinceActivity := time.Since(t.stats.lastActivity)
+
+				if timeSinceActivity > maxIdleTime {
+					t.logError("Connection idle for %v, forcing reconnect", timeSinceActivity)
 					t.stats.addIdleTimeout()
-					errChan <- fmt.Errorf("idle timeout")
+					errChan <- fmt.Errorf("idle timeout after %v", timeSinceActivity)
 					return
 				}
 
-				// Try to detect if WebSocket is still responsive
-				// We can't send ping (IAP rejects it), but we can check if socket is still writable
-				ws.SetWriteDeadline(time.Now().Add(1 * time.Second))
-				if err := ws.WriteMessage(websocket.BinaryMessage, []byte{}); err != nil {
-					t.logError("Health check failed: %v", err)
-					errChan <- fmt.Errorf("health check failed: %w", err)
-					return
-				}
+				t.logDebug("Health check: last activity %v ago", timeSinceActivity)
 
-				t.logDebug("Health check passed")
-
-			case <-ctx.Done():
+			case <-transferCtx.Done():
 				return
 			}
 		}
@@ -932,7 +1016,7 @@ func (t *IAPTunnel) dumpStats() {
 	buf.WriteString("=============================\n\n")
 
 	// Write everything at once to avoid interleaving with shell output
-	fmt.Fprint(os.Stderr, buf.String())
+	t.logInfo("SIGUSR1 Stats Dump:\n%s", buf.String())
 
 	// Force flush stderr
 	os.Stderr.Sync()
@@ -947,4 +1031,11 @@ func isExpectedCloseError(err error) bool {
 		4080, // IAP "error while receiving from client"
 		4004, // IAP "reauthentication required"
 	)
+}
+
+func isTimeoutError(err error) bool {
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	return false
 }
