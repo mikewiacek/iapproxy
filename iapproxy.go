@@ -91,6 +91,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -136,6 +137,12 @@ const (
 	maxIdleTime              = 5 * time.Minute  // Max time without data transfer
 	localHealthCheckInterval = 5 * time.Second  // Check local connection health
 	maxLocalReadTimeout      = 30 * time.Second // Max time to wait for local read
+
+	// Token refresh intervals
+	proactiveTokenRefreshInterval = 20 * time.Minute // Refresh every 20 minutes
+	tokenRefreshJitter            = 2 * time.Minute  // Add randomness to avoid thundering herd
+	maxTokenAge                   = 25 * time.Minute // Force refresh after this time
+	tokenErrorRetryInterval       = 1 * time.Minute  // Retry after token errors
 )
 
 type Config struct {
@@ -151,20 +158,37 @@ type Config struct {
 }
 
 type connectionStats struct {
-	bytesReceived    int64
-	bytesSent        int64
-	connections      int64
-	reconnects       int64
-	startTime        time.Time
-	tokenRefreshes   int64     // number of times tokens have been refreshed
-	wsConnections    int64     // total WebSocket connections made
-	wsErrors         int64     // WebSocket connection errors
-	localErrors      int64     // local connection errors
-	lastTokenRefresh time.Time // when token was last refreshed
-	lastReconnect    time.Time // when last reconnect happened
-	lastActivity     time.Time // Last time data was transferred
-	healthChecks     int64     // Number of health checks performed
-	idleTimeouts     int64     // Number of idle timeouts
+	bytesReceived      int64
+	bytesSent          int64
+	connections        int64
+	reconnects         int64
+	startTime          time.Time
+	tokenRefreshes     int64     // number of times tokens have been refreshed
+	wsConnections      int64     // total WebSocket connections made
+	wsErrors           int64     // WebSocket connection errors
+	localErrors        int64     // local connection errors
+	lastTokenRefresh   time.Time // when token was last refreshed
+	lastReconnect      time.Time // when last reconnect happened
+	lastActivity       time.Time // Last time data was transferred
+	healthChecks       int64     // Number of health checks performed
+	idleTimeouts       int64     // Number of idle timeouts
+	tokenErrors        int64     // number of token-related errors
+	sessionExpiries    int64     // number of times session expired
+	proactiveRefreshes int64     // number of proactive token refreshes
+	lastTokenError     time.Time // when last token error occurred
+}
+
+func (s *connectionStats) addTokenError() {
+	atomic.AddInt64(&s.tokenErrors, 1)
+	s.lastTokenError = time.Now()
+}
+
+func (s *connectionStats) addSessionExpiry() {
+	atomic.AddInt64(&s.sessionExpiries, 1)
+}
+
+func (s *connectionStats) addProactiveRefresh() {
+	atomic.AddInt64(&s.proactiveRefreshes, 1)
 }
 
 func (s *connectionStats) addReceived(bytes int64) {
@@ -294,7 +318,13 @@ type IAPTunnel struct {
 	connectCond        *sync.Cond
 	stats              *connectionStats
 	activeConnections  sync.Map
-	logger             *log.Logger
+
+	currentToken       *oauth2.Token
+	tokenMutex         sync.RWMutex
+	lastTokenTime      time.Time
+	tokenRefreshTicker *time.Ticker
+
+	logger *log.Logger
 }
 
 // NewIAPTunnel creates a tunnel that we can use to pass traffic through IAP.
@@ -303,6 +333,12 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 	tokenSource, err := google.DefaultTokenSource(ctx, iapScope)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token source: %w", err)
+	}
+
+	// Get initial token
+	initialToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get initial token: %w", err)
 	}
 
 	var logWriter io.Writer = os.Stderr
@@ -318,11 +354,13 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 	client.Timeout = connectionTimeout
 
 	tunnel := &IAPTunnel{
-		config:      config,
-		client:      client,
-		tokenSource: tokenSource,
-		stats:       &connectionStats{startTime: time.Now(), lastActivity: time.Now()},
-		logger:      log.New(logWriter, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
+		config:        config,
+		client:        client,
+		tokenSource:   tokenSource,
+		currentToken:  initialToken,
+		lastTokenTime: time.Now(),
+		stats:         &connectionStats{startTime: time.Now(), lastActivity: time.Now()},
+		logger:        log.New(logWriter, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
 	}
 	tunnel.connectCond = sync.NewCond(&tunnel.connectMutex)
 
@@ -360,14 +398,6 @@ func (t *IAPTunnel) reportStats(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
-	}
-}
-
-func (t *IAPTunnel) Start(ctx context.Context) error {
-	if t.config.ListenOnStdin {
-		return t.startStdinTunnel(ctx)
-	} else {
-		return t.startPortTunnel(ctx)
 	}
 }
 
@@ -532,6 +562,17 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 				return ws, nil
 			}
 
+			// Check if this is a token-related error
+			if t.isTokenRelatedError(err) {
+				t.logError("Token-related error detected, forcing token refresh: %v", err)
+				t.stats.addTokenError()
+
+				// Force immediate token refresh
+				if _, refreshErr := t.refreshToken(ctx, "error recovery"); refreshErr != nil {
+					t.logError("Failed to refresh token for error recovery: %v", refreshErr)
+				}
+			}
+
 			t.stats.addWSError()
 			lastErr = err
 			t.logError("WebSocket connection attempt %d failed: %v", attempt, err)
@@ -549,6 +590,16 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 	}
 
 	return nil, fmt.Errorf("failed to connect after %d attempts, last error: %w", maxRetries, lastErr)
+}
+
+func (t *IAPTunnel) isTokenRelatedError(err error) bool {
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "401") ||
+		strings.Contains(errStr, "403") ||
+		strings.Contains(errStr, "unauthorized") ||
+		strings.Contains(errStr, "forbidden") ||
+		strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "token")
 }
 
 // Production-grade bidirectional transfer - matches Python behavior exactly
@@ -814,41 +865,33 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 }
 
 func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, error) {
-	// Check if token needs refresh
-	token, err := t.tokenSource.Token()
+	// Use the comprehensive token refresh strategy
+	token, err := t.getValidToken(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %w", err)
+		return nil, fmt.Errorf("failed to get valid token: %w", err)
 	}
 
-	// Refresh token proactively if it's about to expire
-	if token.Expiry.Before(time.Now().Add(tokenRefreshBuffer)) {
-		t.logDebug("Token expiring soon, refreshing...")
-		// Force refresh by requesting a new token
-		if refresher, ok := t.tokenSource.(oauth2.TokenSource); ok {
-			token, err = refresher.Token()
-			if err != nil {
-				return nil, fmt.Errorf("failed to refresh token: %w", err)
-			}
-			t.stats.addTokenRefresh()
-		}
-	}
-
-	// Build WebSocket URL exactly like Python implementation
+	// Build WebSocket URL with cache buster
 	params := url.Values{}
 	params.Set("project", t.config.ProjectID)
 	params.Set("port", strconv.Itoa(t.config.Port))
-	params.Set("newWebsocket", "true") // Match Python's should_use_new_websocket
+	params.Set("newWebsocket", "true")
 	params.Set("zone", t.config.Zone)
 	params.Set("instance", t.config.Instance)
 	params.Set("interface", "nic0")
+	params.Set("_", fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())) // Cache buster with randomness
 
 	wsURL := fmt.Sprintf("%s?%s", iapTunnelEndpoint, params.Encode())
 
-	// Headers exactly like Python implementation
+	// Headers with fresh token
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+token.AccessToken)
 	headers.Set("User-Agent", "google-cloud-sdk gcloud/go-iap-tunnel")
 	headers.Set("Origin", tunnelOrigin)
+
+	// Log token info for debugging
+	t.logDebug("Using token that expires at: %v (in %v)",
+		token.Expiry, time.Until(token.Expiry))
 
 	// WebSocket dialer configuration - conservative settings
 	dialer := websocket.Dialer{
@@ -873,6 +916,32 @@ func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, erro
 		}
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
+
+	// Set keep-alive ping interval
+	go func() {
+		ticker := time.NewTicker(30 * time.Second) // More frequent than C# version
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					t.logError("Keep-alive ping failed: %v", err)
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Handle pong responses
+	ws.SetPongHandler(func(appData string) error {
+		t.logDebug("Received pong")
+		return nil
+	})
+
+	t.stats.addWSConnection()
 
 	t.logDebug("WebSocket connected successfully")
 	return ws, nil
@@ -937,6 +1006,136 @@ func (t *IAPTunnel) createSubprotocolDataFrame(data []byte) []byte {
 	binary.BigEndian.PutUint32(frame[2:6], uint32(len(data)))
 	copy(frame[6:], data)
 	return frame
+}
+
+func (t *IAPTunnel) getValidToken(ctx context.Context) (*oauth2.Token, error) {
+	t.tokenMutex.RLock()
+	currentToken := t.currentToken
+	lastTokenTime := t.lastTokenTime
+	t.tokenMutex.RUnlock()
+
+	now := time.Now()
+	tokenAge := now.Sub(lastTokenTime)
+
+	// Check multiple conditions for token refresh
+	shouldRefresh := false
+	refreshReason := ""
+
+	if currentToken == nil {
+		shouldRefresh = true
+		refreshReason = "no current token"
+	} else if currentToken.Expiry.Before(now.Add(tokenRefreshBuffer)) {
+		shouldRefresh = true
+		refreshReason = "token expiring soon"
+	} else if tokenAge > maxTokenAge {
+		shouldRefresh = true
+		refreshReason = "token too old"
+	} else if tokenAge > proactiveTokenRefreshInterval {
+		// Add jitter to prevent all connections refreshing simultaneously
+		jitter := time.Duration(rand.Int63n(int64(tokenRefreshJitter)))
+		if tokenAge > proactiveTokenRefreshInterval+jitter {
+			shouldRefresh = true
+			refreshReason = "proactive refresh"
+		}
+	}
+
+	if shouldRefresh {
+		return t.refreshToken(ctx, refreshReason)
+	}
+
+	return currentToken, nil
+}
+
+func (t *IAPTunnel) refreshToken(ctx context.Context, reason string) (*oauth2.Token, error) {
+	t.tokenMutex.Lock()
+	defer t.tokenMutex.Unlock()
+
+	// Double-check if another goroutine already refreshed
+	if reason == "proactive refresh" && time.Since(t.lastTokenTime) < proactiveTokenRefreshInterval {
+		t.logDebug("Token was already refreshed by another goroutine")
+		return t.currentToken, nil
+	}
+
+	t.logDebug("Refreshing token: %s", reason)
+
+	// Get fresh token with timeout
+	tokenCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Create a new token source to force refresh
+	freshTokenSource, err := google.DefaultTokenSource(tokenCtx, iapScope)
+	if err != nil {
+		t.stats.addTokenError()
+		return nil, fmt.Errorf("failed to create fresh token source: %w", err)
+	}
+
+	newToken, err := freshTokenSource.Token()
+	if err != nil {
+		t.stats.addTokenError()
+		return nil, fmt.Errorf("failed to refresh token: %w", err)
+	}
+
+	// Validate token
+	if newToken.AccessToken == "" {
+		t.stats.addTokenError()
+		return nil, fmt.Errorf("received empty access token")
+	}
+
+	// Update stored token
+	t.currentToken = newToken
+	t.lastTokenTime = time.Now()
+
+	// Update token source for OAuth client
+	t.tokenSource = oauth2.StaticTokenSource(newToken)
+	t.client = oauth2.NewClient(tokenCtx, t.tokenSource)
+	t.client.Timeout = connectionTimeout
+
+	if reason == "proactive refresh" {
+		t.stats.addProactiveRefresh()
+	} else {
+		t.stats.addTokenRefresh()
+	}
+
+	t.logDebug("Token refreshed successfully, expires: %v", newToken.Expiry)
+	return newToken, nil
+}
+
+func (t *IAPTunnel) Start(ctx context.Context) error {
+	// Start proactive token refresh service
+	go t.runTokenRefreshService(ctx)
+
+	if t.config.ListenOnStdin {
+		return t.startStdinTunnel(ctx)
+	} else {
+		return t.startPortTunnel(ctx)
+	}
+}
+
+func (t *IAPTunnel) runTokenRefreshService(ctx context.Context) {
+	// Add jitter to initial refresh to spread load
+	initialDelay := proactiveTokenRefreshInterval + time.Duration(rand.Int63n(int64(tokenRefreshJitter)))
+	ticker := time.NewTicker(initialDelay)
+	defer ticker.Stop()
+
+	t.logDebug("Started proactive token refresh service (interval: %v)", proactiveTokenRefreshInterval)
+
+	for {
+		select {
+		case <-ticker.C:
+			// Reset ticker to regular interval after first run
+			ticker.Reset(proactiveTokenRefreshInterval)
+
+			if _, err := t.getValidToken(ctx); err != nil {
+				t.logError("Proactive token refresh failed: %v", err)
+				// Retry sooner on errors
+				ticker.Reset(tokenErrorRetryInterval)
+			}
+
+		case <-ctx.Done():
+			t.logDebug("Token refresh service stopped")
+			return
+		}
+	}
 }
 
 func (t *IAPTunnel) dumpStats() {
