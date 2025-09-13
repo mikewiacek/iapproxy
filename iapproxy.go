@@ -30,15 +30,6 @@
 //	    Port 22
 //	    ProxyCommand iapproxy --project=my-project --zone=us-central1-a --listen-on-stdin %h %p
 //
-// # Flags
-//
-//	--project         Google Cloud project ID (required)
-//	--zone           Zone of the target VM instance (required)
-//	--local-port     Local port to listen on (default: random available port)
-//	--local-host     Local address to bind to (default: 127.0.0.1)
-//	--listen-on-stdin Use stdin/stdout instead of creating a local port
-//	--verbosity      Logging level: error, warning, info, debug (default: warning)
-//
 // # Authentication
 //
 // This tool uses Google Cloud Application Default Credentials (ADC). Ensure you are
@@ -54,33 +45,6 @@
 //
 //	roles/iap.tunnelResourceAccessor
 //	roles/compute.instanceAdmin.v1 (or roles/compute.viewer for read-only access)
-//
-// # Implementation Notes
-//
-// This implementation follows the exact protocol specification used by gcloud's IAP tunnel,
-// including:
-//   - WebSocket subprotocol: relay.tunnel.cloudproxy.app
-//   - Binary frame format matching Google's specification
-//   - OAuth2 Bearer token authentication
-//   - Automatic connection recovery and token refresh
-//   - Support for both new and legacy WebSocket protocols
-//
-// Unlike the Python gcloud implementation, this tool is optimized for:
-//   - Lower latency through reduced buffering
-//   - Better connection stability with robust retry logic
-//   - Production-grade error handling and monitoring
-//   - Minimal resource usage suitable for long-running tunnels
-//
-// # Security
-//
-// All traffic is encrypted end-to-end:
-//   - TLS 1.2+ for WebSocket connection to Google Cloud IAP
-//   - OAuth2 Bearer tokens for authentication
-//   - No credentials stored locally beyond ADC token cache
-//
-// The tool establishes a secure tunnel but does not perform additional encryption
-// of the tunneled traffic. Use appropriate encryption for your application protocol
-// (e.g., SSH, HTTPS) as needed.
 package main
 
 import (
@@ -90,7 +54,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -104,47 +67,53 @@ import (
 	"syscall"
 	"time"
 
+	log "github.com/golang/glog"
 	"github.com/gorilla/websocket"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
+// IAP tunnel endpoint and protocol constants.
 const (
 	iapTunnelEndpoint = "wss://tunnel.cloudproxy.app/v4/connect"
 	iapScope          = "https://www.googleapis.com/auth/cloud-platform"
 	subprotocolName   = "relay.tunnel.cloudproxy.app"
 	tunnelOrigin      = "bot:iap-tunneler"
+)
 
-	// Subprotocol constants from Python implementation
-	SUBPROTOCOL_TAG_CONNECT_SUCCESS_SID   = 0x0001
-	SUBPROTOCOL_TAG_RECONNECT_SUCCESS_ACK = 0x0002
-	SUBPROTOCOL_TAG_DATA                  = 0x0004
-	SUBPROTOCOL_TAG_ACK                   = 0x0007
+// Subprotocol tag constants from the IAP specification.
+const (
+	subprotocolTagConnectSuccessSID   = 0x0001
+	subprotocolTagReconnectSuccessACK = 0x0002
+	subprotocolTagData                = 0x0004
+	subprotocolTagACK                 = 0x0007
+)
 
-	// Buffer sizes - conservative values based on Python implementation
+// Buffer and connection configuration constants.
+const (
 	readBufferSize  = 16 * 1024 // 16KB read buffer
 	writeBufferSize = 16 * 1024 // 16KB write buffer
-	maxFrameSize    = 16 * 1024 // 16KB max frame size (matches Python SUBPROTOCOL_MAX_DATA_FRAME_SIZE)
+	maxFrameSize    = 16 * 1024 // 16KB max frame size
 
-	// Connection management
-	maxRetries               = 3
-	retryBackoff             = 1 * time.Second
-	connectionTimeout        = 30 * time.Second
-	writeTimeout             = 10 * time.Second
-	readTimeout              = 60 * time.Second
+	maxRetries        = 3
+	retryBackoff      = 1 * time.Second
+	connectionTimeout = 30 * time.Second
+	writeTimeout      = 10 * time.Second
+	readTimeout       = 60 * time.Second
+
 	tokenRefreshBuffer       = 5 * time.Minute  // Refresh token 5 minutes before expiry
 	healthCheckInterval      = 30 * time.Second // Check connection health
 	maxIdleTime              = 5 * time.Minute  // Max time without data transfer
 	localHealthCheckInterval = 5 * time.Second  // Check local connection health
 	maxLocalReadTimeout      = 30 * time.Second // Max time to wait for local read
 
-	// Token refresh intervals
 	proactiveTokenRefreshInterval = 20 * time.Minute // Refresh every 20 minutes
 	tokenRefreshJitter            = 2 * time.Minute  // Add randomness to avoid thundering herd
 	maxTokenAge                   = 25 * time.Minute // Force refresh after this time
 	tokenErrorRetryInterval       = 1 * time.Minute  // Retry after token errors
 )
 
+// Config holds the tunnel configuration parameters.
 type Config struct {
 	ProjectID     string
 	Zone          string
@@ -152,183 +121,205 @@ type Config struct {
 	Port          int
 	LocalPort     int
 	LocalHost     string
-	Verbosity     string
 	ListenOnStdin bool
-	LogFile       string
+	LogFile       string // Keep this for explicit log file control beyond log
 }
 
+// connectionStats tracks tunnel performance and reliability metrics.
 type connectionStats struct {
-	bytesReceived      int64
-	bytesSent          int64
-	connections        int64
-	reconnects         int64
-	startTime          time.Time
-	tokenRefreshes     int64     // number of times tokens have been refreshed
-	wsConnections      int64     // total WebSocket connections made
-	wsErrors           int64     // WebSocket connection errors
-	localErrors        int64     // local connection errors
-	lastTokenRefresh   time.Time // when token was last refreshed
-	lastReconnect      time.Time // when last reconnect happened
-	lastActivity       time.Time // Last time data was transferred
-	healthChecks       int64     // Number of health checks performed
-	idleTimeouts       int64     // Number of idle timeouts
-	tokenErrors        int64     // number of token-related errors
-	sessionExpiries    int64     // number of times session expired
-	proactiveRefreshes int64     // number of proactive token refreshes
-	lastTokenError     time.Time // when last token error occurred
+	bytesReceived    int64
+	bytesSent        int64
+	connections      int64
+	reconnects       int64
+	tokenRefreshes   int64
+	wsConnections    int64
+	wsErrors         int64
+	localErrors      int64
+	healthChecks     int64
+	idleTimeouts     int64
+	tokenErrors      int64
+	sessionExpiries  int64
+	proactiveRefresh int64
+
+	startTime        time.Time
+	lastTokenRefresh time.Time
+	lastReconnect    time.Time
+	lastActivity     time.Time
+	lastTokenError   time.Time
 }
 
+// addTokenError increments the token error counter.
 func (s *connectionStats) addTokenError() {
 	atomic.AddInt64(&s.tokenErrors, 1)
 	s.lastTokenError = time.Now()
 }
 
-func (s *connectionStats) addSessionExpiry() {
-	atomic.AddInt64(&s.sessionExpiries, 1)
-}
-
-func (s *connectionStats) addProactiveRefresh() {
-	atomic.AddInt64(&s.proactiveRefreshes, 1)
-}
-
+// addReceived increments the bytes received counter.
 func (s *connectionStats) addReceived(bytes int64) {
 	atomic.AddInt64(&s.bytesReceived, bytes)
 }
 
+// addSent increments the bytes sent counter.
 func (s *connectionStats) addSent(bytes int64) {
 	atomic.AddInt64(&s.bytesSent, bytes)
 }
 
+// addConnection increments the connection counter.
 func (s *connectionStats) addConnection() {
 	atomic.AddInt64(&s.connections, 1)
 }
 
+// addTokenRefresh increments the token refresh counter and updates timestamp.
 func (s *connectionStats) addTokenRefresh() {
 	atomic.AddInt64(&s.tokenRefreshes, 1)
 	s.lastTokenRefresh = time.Now()
 }
 
+// addWSConnection increments the WebSocket connection counter.
 func (s *connectionStats) addWSConnection() {
 	atomic.AddInt64(&s.wsConnections, 1)
 }
 
+// addWSError increments the WebSocket error counter.
 func (s *connectionStats) addWSError() {
 	atomic.AddInt64(&s.wsErrors, 1)
 }
 
+// addLocalError increments the local connection error counter.
 func (s *connectionStats) addLocalError() {
 	atomic.AddInt64(&s.localErrors, 1)
 }
 
+// addReconnect increments the reconnect counter and updates timestamp.
 func (s *connectionStats) addReconnect() {
 	atomic.AddInt64(&s.reconnects, 1)
 	s.lastReconnect = time.Now()
 }
 
+// updateActivity updates the last activity timestamp.
 func (s *connectionStats) updateActivity() {
 	s.lastActivity = time.Now()
 }
 
+// addHealthCheck increments the health check counter.
 func (s *connectionStats) addHealthCheck() {
 	atomic.AddInt64(&s.healthChecks, 1)
 }
 
+// addIdleTimeout increments the idle timeout counter.
 func (s *connectionStats) addIdleTimeout() {
 	atomic.AddInt64(&s.idleTimeouts, 1)
 }
 
+// addProactiveRefresh increments the proactive token refresh counter.
+func (s *connectionStats) addProactiveRefresh() {
+	atomic.AddInt64(&s.proactiveRefresh, 1)
+}
+
 func main() {
+	defer log.Flush()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	config, err := parseFlags()
+	if err != nil {
+		log.Exitf("Configuration error: %v", err)
+	}
+
+	tunnel, err := NewIAPTunnel(ctx, config)
+	if err != nil {
+		log.Exitf("Failed to create tunnel: %v", err)
+	}
+
+	setupSignalHandlers(ctx, cancel, tunnel)
+
+	// Start statistics reporting if debug logging is enabled (log V(2))
+	if log.V(2) {
+		go tunnel.reportStats(ctx)
+	}
+
+	if err := tunnel.Start(ctx); err != nil && err != context.Canceled {
+		log.Exitf("Tunnel failed: %v", err)
+	}
+}
+
+// parseFlags parses and validates command line arguments.
+func parseFlags() (Config, error) {
 	var config Config
 
 	flag.StringVar(&config.ProjectID, "project", "", "Google Cloud project ID")
 	flag.StringVar(&config.Zone, "zone", "", "Zone of the instance")
 	flag.IntVar(&config.LocalPort, "local-port", 0, "Local port to listen on")
 	flag.StringVar(&config.LocalHost, "local-host", "127.0.0.1", "Local host to bind to")
-	flag.StringVar(&config.Verbosity, "verbosity", "warning", "Verbosity level (debug, info, warning, error)")
 	flag.BoolVar(&config.ListenOnStdin, "listen-on-stdin", false, "Listen on stdin instead of creating local port")
-	flag.StringVar(&config.LogFile, "log-file", "", "Log file path (default: stderr)")
+	flag.StringVar(&config.LogFile, "log-file", "", "Log file path (in addition to log settings) to log stats on receiving a SIGUSR1 signal")
 
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 2 {
-		log.Fatal("Usage: iap-tunnel [flags] INSTANCE_NAME PORT")
+		return config, fmt.Errorf("usage: iap-tunnel [flags] INSTANCE_NAME PORT")
 	}
 
 	config.Instance = args[0]
 	port, err := strconv.Atoi(args[1])
 	if err != nil {
-		log.Fatalf("Invalid port: %s", args[1])
+		return config, fmt.Errorf("invalid port: %s", args[1])
 	}
 	config.Port = port
 
 	if config.ProjectID == "" {
-		log.Fatal("Project ID is required (use --project flag)")
+		return config, fmt.Errorf("project ID is required (use --project flag)")
 	}
 	if config.Zone == "" {
-		log.Fatal("Zone is required (use --zone flag)")
+		return config, fmt.Errorf("zone is required (use --zone flag)")
 	}
 
-	tunnel, err := NewIAPTunnel(ctx, config)
-	if err != nil {
-		log.Fatalf("Failed to create tunnel: %v", err)
-	}
+	return config, nil
+}
 
-	// Graceful shutdown and stats dumping
+// setupSignalHandlers configures signal handling for graceful shutdown and stats dumping.
+func setupSignalHandlers(ctx context.Context, cancel context.CancelFunc, tunnel *IAPTunnel) {
 	sigChan := make(chan os.Signal, 1)
 	statsChan := make(chan os.Signal, 1)
+
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(statsChan, syscall.SIGUSR1)
 
 	go func() {
 		<-sigChan
-		tunnel.logDebug("Received shutdown signal")
+		log.V(1).Info("Received shutdown signal")
 		cancel()
 	}()
 
-	// Handle SIGUSR1 for stats dumping
 	go func() {
 		for {
 			<-statsChan
 			tunnel.dumpStats()
 		}
 	}()
-
-	// Start statistics reporting if debug mode
-	if config.Verbosity == "debug" {
-		go tunnel.reportStats(ctx)
-	}
-
-	if err := tunnel.Start(ctx); err != nil && err != context.Canceled {
-		log.Fatalf("Tunnel failed: %v", err)
-	}
 }
 
+// IAPTunnel manages the IAP tunnel connection and data transfer.
 type IAPTunnel struct {
 	config             Config
 	client             *http.Client
 	tokenSource        oauth2.TokenSource
-	connectionSid      string
-	totalBytesReceived int64
+	connectionSID      string
+	totalBytesReceived int64 // Total bytes received across all connections
 	connected          bool
 	connectMutex       sync.RWMutex
 	connectCond        *sync.Cond
 	stats              *connectionStats
-	activeConnections  sync.Map
+	activeConnections  sync.Map // Track active connection IDs for monitoring
 
-	currentToken       *oauth2.Token
-	tokenMutex         sync.RWMutex
-	lastTokenTime      time.Time
-	tokenRefreshTicker *time.Ticker
-
-	logger *log.Logger
+	currentToken  *oauth2.Token
+	tokenMutex    sync.RWMutex
+	lastTokenTime time.Time
 }
 
-// NewIAPTunnel creates a tunnel that we can use to pass traffic through IAP.
-// ctx is only used for the duration of NewIAPTunnel.
+// NewIAPTunnel creates a new IAP tunnel instance.
 func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 	tokenSource, err := google.DefaultTokenSource(ctx, iapScope)
 	if err != nil {
@@ -341,15 +332,6 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 		return nil, fmt.Errorf("failed to get initial token: %w", err)
 	}
 
-	var logWriter io.Writer = os.Stderr
-	if config.LogFile != "" {
-		f, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open log file: %w", err)
-		}
-		logWriter = f
-	}
-
 	client := oauth2.NewClient(ctx, tokenSource)
 	client.Timeout = connectionTimeout
 
@@ -359,30 +341,19 @@ func NewIAPTunnel(ctx context.Context, config Config) (*IAPTunnel, error) {
 		tokenSource:   tokenSource,
 		currentToken:  initialToken,
 		lastTokenTime: time.Now(),
-		stats:         &connectionStats{startTime: time.Now(), lastActivity: time.Now()},
-		logger:        log.New(logWriter, "[IAP-TUNNEL] ", log.LstdFlags|log.Lmicroseconds),
+		stats: &connectionStats{
+			startTime:    time.Now(),
+			lastActivity: time.Now(),
+		},
 	}
 	tunnel.connectCond = sync.NewCond(&tunnel.connectMutex)
+
+	log.V(1).Infof("IAP tunnel created for %s:%d in %s/%s", config.Instance, config.Port, config.ProjectID, config.Zone)
 
 	return tunnel, nil
 }
 
-func (t *IAPTunnel) logDebug(format string, args ...interface{}) {
-	if t.config.Verbosity == "debug" {
-		t.logger.Printf("DEBUG: "+format, args...)
-	}
-}
-
-func (t *IAPTunnel) logInfo(format string, args ...interface{}) {
-	if t.config.Verbosity == "debug" || t.config.Verbosity == "info" {
-		t.logger.Printf("INFO: "+format, args...)
-	}
-}
-
-func (t *IAPTunnel) logError(format string, args ...interface{}) {
-	t.logger.Printf("ERROR: "+format, args...)
-}
-
+// reportStats periodically reports tunnel statistics in debug mode.
 func (t *IAPTunnel) reportStats(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -390,10 +361,18 @@ func (t *IAPTunnel) reportStats(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			t.logDebug("Stats: received=%d bytes, sent=%d bytes, connections=%d, reconnects=%d",
+			activeConns := 0
+			t.activeConnections.Range(func(key, value interface{}) bool {
+				activeConns++
+				return true
+			})
+
+			log.V(2).Infof("Stats: received=%d bytes, sent=%d bytes, total_received=%d, connections=%d, active=%d, reconnects=%d",
 				atomic.LoadInt64(&t.stats.bytesReceived),
 				atomic.LoadInt64(&t.stats.bytesSent),
+				atomic.LoadInt64(&t.totalBytesReceived),
 				atomic.LoadInt64(&t.stats.connections),
+				activeConns,
 				atomic.LoadInt64(&t.stats.reconnects))
 		case <-ctx.Done():
 			return
@@ -401,6 +380,7 @@ func (t *IAPTunnel) reportStats(ctx context.Context) {
 	}
 }
 
+// waitForConnection waits until the tunnel connection is established.
 func (t *IAPTunnel) waitForConnection(ctx context.Context) error {
 	t.connectMutex.Lock()
 	defer t.connectMutex.Unlock()
@@ -416,6 +396,7 @@ func (t *IAPTunnel) waitForConnection(ctx context.Context) error {
 	return nil
 }
 
+// setConnected updates the connection state and broadcasts to waiting goroutines.
 func (t *IAPTunnel) setConnected(connected bool) {
 	t.connectMutex.Lock()
 	defer t.connectMutex.Unlock()
@@ -426,7 +407,21 @@ func (t *IAPTunnel) setConnected(connected bool) {
 	}
 }
 
+// Start begins the tunnel operation in either stdin or port listening mode.
+func (t *IAPTunnel) Start(ctx context.Context) error {
+	// Start proactive token refresh service
+	go t.runTokenRefreshService(ctx)
+
+	if t.config.ListenOnStdin {
+		return t.startStdinTunnel(ctx)
+	}
+	return t.startPortTunnel(ctx)
+}
+
+// startStdinTunnel handles tunnel operations using stdin/stdout.
 func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
+	log.V(1).Info("Starting stdin tunnel mode")
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -437,10 +432,8 @@ func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
 				return fmt.Errorf("failed to connect to IAP: %w", err)
 			}
 
-			// Reset connection state
 			t.setConnected(false)
-
-			err = t.handleBidirectionalTransfer(ctx, ws, os.Stdin, os.Stdout)
+			err = t.handleBidirectionalTransfer(ctx, ws, os.Stdin, os.Stdout, "stdin")
 
 			// Clean shutdown of WebSocket
 			ws.SetWriteDeadline(time.Now().Add(1 * time.Second))
@@ -451,9 +444,8 @@ func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
 				return err
 			}
 
-			t.logError("Connection lost, retrying: %v", err)
+			log.Warningf("Connection lost, retrying: %v", err)
 
-			// Brief delay before retry to let things settle
 			select {
 			case <-time.After(retryBackoff):
 			case <-ctx.Done():
@@ -463,13 +455,9 @@ func (t *IAPTunnel) startStdinTunnel(ctx context.Context) error {
 	}
 }
 
+// startPortTunnel handles tunnel operations using a local TCP port.
 func (t *IAPTunnel) startPortTunnel(ctx context.Context) error {
-	localPort := t.config.LocalPort
-	if localPort == 0 {
-		localPort = 0
-	}
-
-	localAddr := fmt.Sprintf("%s:%d", t.config.LocalHost, localPort)
+	localAddr := fmt.Sprintf("%s:%d", t.config.LocalHost, t.config.LocalPort)
 	listener, err := net.Listen("tcp", localAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", localAddr, err)
@@ -478,8 +466,8 @@ func (t *IAPTunnel) startPortTunnel(ctx context.Context) error {
 
 	actualPort := listener.Addr().(*net.TCPAddr).Port
 	fmt.Printf("Listening on port [%d].\n", actualPort)
+	log.V(1).Infof("Started port tunnel mode on %s:%d", t.config.LocalHost, actualPort)
 
-	// Accept connections concurrently
 	for {
 		select {
 		case <-ctx.Done():
@@ -490,23 +478,33 @@ func (t *IAPTunnel) startPortTunnel(ctx context.Context) error {
 				if strings.Contains(err.Error(), "use of closed network connection") {
 					return ctx.Err()
 				}
-				t.logError("Accept error: %v", err)
+				log.Errorf("Accept error: %v", err)
 				continue
 			}
 
 			t.stats.addConnection()
-			go t.handleConnection(ctx, conn)
+			connID := fmt.Sprintf("%s-%d", conn.RemoteAddr().String(), time.Now().UnixNano())
+			log.V(2).Infof("Accepted new connection: %s", connID)
+
+			go t.handleConnection(ctx, conn, connID)
 		}
 	}
 }
 
-func (t *IAPTunnel) handleConnection(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+// handleConnection manages a single client connection through the tunnel.
+func (t *IAPTunnel) handleConnection(ctx context.Context, conn net.Conn, connID string) {
+	defer func() {
+		conn.Close()
+		t.activeConnections.Delete(connID)
+		log.V(2).Infof("Connection %s closed", connID)
+	}()
+
+	// Track this connection
+	t.activeConnections.Store(connID, time.Now())
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Robust connection handling with retries
 	for {
 		select {
 		case <-connCtx.Done():
@@ -514,11 +512,11 @@ func (t *IAPTunnel) handleConnection(ctx context.Context, conn net.Conn) {
 		default:
 			ws, err := t.connectWebSocketWithRetry(connCtx)
 			if err != nil {
-				t.logError("Failed to connect to IAP for connection: %v", err)
+				log.Errorf("Failed to connect to IAP for connection %s: %v", connID, err)
 				return
 			}
 
-			err = t.handleBidirectionalTransfer(connCtx, ws, conn, conn)
+			err = t.handleBidirectionalTransfer(connCtx, ws, conn, conn, connID)
 			ws.Close()
 
 			if err == context.Canceled || err == context.DeadlineExceeded {
@@ -530,13 +528,10 @@ func (t *IAPTunnel) handleConnection(ctx context.Context, conn net.Conn) {
 			buf := make([]byte, 1)
 			_, err = conn.Read(buf)
 			if err != nil {
-				// Connection is closed, exit
 				return
 			}
-			// Put the byte back (this is a hack, but works for most protocols)
-			// In production, you'd want a proper peek mechanism
 
-			t.logError("WebSocket connection lost, retrying: %v", err)
+			log.Warningf("WebSocket connection lost for %s, retrying: %v", connID, err)
 			t.setConnected(false)
 			t.stats.addReconnect()
 
@@ -549,6 +544,7 @@ func (t *IAPTunnel) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// connectWebSocketWithRetry attempts to establish a WebSocket connection with retry logic.
 func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.Conn, error) {
 	var lastErr error
 
@@ -562,24 +558,22 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 				return ws, nil
 			}
 
-			// Check if this is a token-related error
 			if t.isTokenRelatedError(err) {
-				t.logError("Token-related error detected, forcing token refresh: %v", err)
+				log.Warningf("Token-related error detected, forcing token refresh: %v", err)
 				t.stats.addTokenError()
 
-				// Force immediate token refresh
 				if _, refreshErr := t.refreshToken(ctx, "error recovery"); refreshErr != nil {
-					t.logError("Failed to refresh token for error recovery: %v", refreshErr)
+					log.Errorf("Failed to refresh token for error recovery: %v", refreshErr)
 				}
 			}
 
 			t.stats.addWSError()
 			lastErr = err
-			t.logError("WebSocket connection attempt %d failed: %v", attempt, err)
+			log.Warningf("WebSocket connection attempt %d failed: %v", attempt, err)
 
 			if attempt < maxRetries {
 				backoff := time.Duration(attempt) * retryBackoff
-				t.logDebug("Retrying in %v", backoff)
+				log.V(1).Infof("Retrying in %v", backoff)
 				select {
 				case <-time.After(backoff):
 				case <-ctx.Done():
@@ -592,6 +586,7 @@ func (t *IAPTunnel) connectWebSocketWithRetry(ctx context.Context) (*websocket.C
 	return nil, fmt.Errorf("failed to connect after %d attempts, last error: %w", maxRetries, lastErr)
 }
 
+// isTokenRelatedError checks if an error is related to authentication or authorization.
 func (t *IAPTunnel) isTokenRelatedError(err error) bool {
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "401") ||
@@ -602,259 +597,33 @@ func (t *IAPTunnel) isTokenRelatedError(err error) bool {
 		strings.Contains(errStr, "token")
 }
 
-// Production-grade bidirectional transfer - matches Python behavior exactly
-func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websocket.Conn, reader io.Reader, writer io.Writer) error {
-	// Create a context that we can cancel when we detect errors
+// handleBidirectionalTransfer manages data transfer between local and WebSocket connections.
+func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websocket.Conn, reader io.Reader, writer io.Writer, connID string) error {
 	transferCtx, transferCancel := context.WithCancel(ctx)
 	defer transferCancel()
-
-	// No ping/pong - removed completely as Python implementation rejects it
-	// No batching - send frames immediately like Python implementation
 
 	errChan := make(chan error, 4)
 
 	// WebSocket message reader
-	// WebSocket message reader with enhanced monitoring
-	go func() {
-		defer func() {
-			t.logDebug("WebSocket reader goroutine exiting")
-			transferCancel()
-			errChan <- nil
-		}()
-
-		consecutiveErrors := 0
-		const maxConsecutiveErrors = 3
-		lastRemoteActivity := time.Now()
-
-		// Monitor for remote activity
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					// If we haven't seen remote activity in a while, that might be normal
-					// But log it for debugging
-					timeSinceRemote := time.Since(lastRemoteActivity)
-					if timeSinceRemote > 2*time.Minute {
-						t.logDebug("No remote activity for %v (might be normal)", timeSinceRemote)
-					}
-
-				case <-transferCtx.Done():
-					return
-				}
-			}
-		}()
-
-		for {
-			select {
-			case <-transferCtx.Done():
-				return
-			default:
-				ws.SetReadDeadline(time.Now().Add(readTimeout))
-
-				messageType, data, err := ws.ReadMessage()
-				if err != nil {
-					consecutiveErrors++
-
-					if websocket.IsCloseError(err, 4080, 4004) {
-						t.logError("IAP connection error (code in close): %v", err)
-						errChan <- fmt.Errorf("IAP connection error: %w", err)
-						return
-					}
-
-					if consecutiveErrors >= maxConsecutiveErrors {
-						t.logError("Too many consecutive read errors (%d), forcing reconnect", consecutiveErrors)
-						errChan <- fmt.Errorf("consecutive error threshold exceeded")
-						return
-					}
-
-					if !isExpectedCloseError(err) {
-						t.logError("WebSocket read error #%d: %v", consecutiveErrors, err)
-						t.stats.addWSError()
-						time.Sleep(100 * time.Millisecond)
-						continue
-					}
-					return
-				}
-
-				consecutiveErrors = 0
-				lastRemoteActivity = time.Now()
-
-				if messageType == websocket.BinaryMessage {
-					if extractedData := t.extractDataFromWebSocketMessage(data); extractedData != nil {
-						t.stats.addReceived(int64(len(extractedData)))
-						t.stats.updateActivity()
-
-						t.logDebug("Received %d bytes from WebSocket", len(extractedData))
-
-						// Write with timeout and proper error handling
-						if netConn, ok := writer.(net.Conn); ok {
-							netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
-						}
-
-						_, err := writer.Write(extractedData)
-						if err != nil {
-							t.logError("Local write error: %v", err)
-							t.stats.addLocalError()
-							errChan <- err
-							return
-						}
-					}
-				}
-			}
-		}
-	}()
+	go t.runWebSocketReader(transferCtx, ws, writer, errChan, transferCancel, connID)
 
 	// Local reader to WebSocket writer
-	// Local reader to WebSocket writer with bidirectional health monitoring
-	go func() {
-		defer func() {
-			t.logDebug("Local reader goroutine exiting")
-			transferCancel()
-			errChan <- nil
-		}()
+	go t.runLocalReader(transferCtx, ws, reader, errChan, transferCancel, connID)
 
-		buffer := make([]byte, maxFrameSize)
-		lastLocalActivity := time.Now()
-
-		// Health monitoring for local connection
-		go func() {
-			ticker := time.NewTicker(localHealthCheckInterval)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					// Check if local connection has been quiet too long
-					if time.Since(lastLocalActivity) > maxLocalReadTimeout {
-						// Try a non-blocking read to test if connection is still alive
-						if netConn, ok := reader.(net.Conn); ok {
-							netConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-							testBuf := make([]byte, 1)
-							n, err := netConn.Read(testBuf)
-
-							if err != nil && !isTimeoutError(err) {
-								t.logError("Local connection health check failed: %v", err)
-								transferCancel()
-								return
-							}
-
-							// If we read a byte, we need to handle it
-							if n > 0 {
-								// Process the byte we just read
-								frame := t.createSubprotocolDataFrame(testBuf[:n])
-								ws.SetWriteDeadline(time.Now().Add(writeTimeout))
-								if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-									t.logError("WebSocket write error during health check: %v", err)
-									transferCancel()
-									return
-								}
-								t.stats.addSent(1)
-								t.stats.updateActivity()
-								lastLocalActivity = time.Now()
-							}
-
-							// Reset to blocking mode
-							netConn.SetReadDeadline(time.Time{})
-						}
-					}
-
-				case <-transferCtx.Done():
-					return
-				}
-			}
-		}()
-
-		for {
-			select {
-			case <-transferCtx.Done():
-				return
-			default:
-				// Don't set a read deadline here - let the health monitor handle timeouts
-				n, err := reader.Read(buffer)
-				if err == io.EOF {
-					t.logDebug("Local connection closed (EOF)")
-					return
-				}
-				if err != nil {
-					if isTimeoutError(err) {
-						// Update last activity time even for timeouts
-						lastLocalActivity = time.Now()
-						continue
-					}
-					t.logError("Local read error: %v", err)
-					t.stats.addLocalError()
-					errChan <- err
-					return
-				}
-
-				lastLocalActivity = time.Now()
-
-				if n > 0 {
-					data := make([]byte, n)
-					copy(data, buffer[:n])
-
-					frame := t.createSubprotocolDataFrame(data)
-					ws.SetWriteDeadline(time.Now().Add(writeTimeout))
-
-					if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-						t.logError("WebSocket write error: %v", err)
-						t.stats.addWSError()
-						errChan <- err
-						return
-					}
-
-					t.stats.addSent(int64(n))
-					t.stats.updateActivity()
-					t.logDebug("Sent %d bytes to WebSocket", n)
-				}
-			}
-		}
-	}()
-
-	go func() {
-		defer func() { errChan <- nil }()
-
-		ticker := time.NewTicker(healthCheckInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				t.stats.addHealthCheck()
-
-				// Passive check - only look at activity, don't send anything
-				timeSinceActivity := time.Since(t.stats.lastActivity)
-
-				if timeSinceActivity > maxIdleTime {
-					t.logError("Connection idle for %v, forcing reconnect", timeSinceActivity)
-					t.stats.addIdleTimeout()
-					errChan <- fmt.Errorf("idle timeout after %v", timeSinceActivity)
-					return
-				}
-
-				t.logDebug("Health check: last activity %v ago", timeSinceActivity)
-
-			case <-transferCtx.Done():
-				return
-			}
-		}
-	}()
+	// Health monitor
+	go t.runHealthMonitor(transferCtx, errChan, connID)
 
 	// Wait for connection to be established
 	if err := t.waitForConnection(transferCtx); err != nil {
 		return err
 	}
 
-	t.logDebug("Bidirectional transfer started")
+	log.V(2).Infof("Bidirectional transfer started for connection %s", connID)
 
 	// Wait for first error or context cancellation
 	select {
 	case err := <-errChan:
-		// Give a moment for other goroutines to clean up
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // Give other goroutines time to clean up
 		if err != nil {
 			return err
 		}
@@ -864,8 +633,158 @@ func (t *IAPTunnel) handleBidirectionalTransfer(ctx context.Context, ws *websock
 	}
 }
 
+// runWebSocketReader handles reading messages from the WebSocket connection.
+func (t *IAPTunnel) runWebSocketReader(ctx context.Context, ws *websocket.Conn, writer io.Writer, errChan chan<- error, cancel context.CancelFunc, connID string) {
+	defer func() {
+		log.V(3).Infof("WebSocket reader goroutine exiting for %s", connID)
+		cancel()
+		errChan <- nil
+	}()
+
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 3
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			ws.SetReadDeadline(time.Now().Add(readTimeout))
+
+			messageType, data, err := ws.ReadMessage()
+			if err != nil {
+				consecutiveErrors++
+
+				if websocket.IsCloseError(err, 4080, 4004) {
+					log.Errorf("IAP connection error (code in close) for %s: %v", connID, err)
+					errChan <- fmt.Errorf("IAP connection error: %w", err)
+					return
+				}
+
+				if consecutiveErrors >= maxConsecutiveErrors {
+					log.Errorf("Too many consecutive read errors (%d) for %s, forcing reconnect", consecutiveErrors, connID)
+					errChan <- fmt.Errorf("consecutive error threshold exceeded")
+					return
+				}
+
+				if !isExpectedCloseError(err) {
+					log.Warningf("WebSocket read error #%d for %s: %v", consecutiveErrors, connID, err)
+					t.stats.addWSError()
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				return
+			}
+
+			consecutiveErrors = 0
+
+			if messageType == websocket.BinaryMessage {
+				if extractedData := t.extractDataFromWebSocketMessage(data); extractedData != nil {
+					dataLen := int64(len(extractedData))
+					t.stats.addReceived(dataLen)
+					atomic.AddInt64(&t.totalBytesReceived, dataLen)
+					t.stats.updateActivity()
+
+					log.V(3).Infof("Received %d bytes from WebSocket for %s", len(extractedData), connID)
+
+					if netConn, ok := writer.(net.Conn); ok {
+						netConn.SetWriteDeadline(time.Now().Add(writeTimeout))
+					}
+
+					if _, err := writer.Write(extractedData); err != nil {
+						log.Errorf("Local write error for %s: %v", connID, err)
+						t.stats.addLocalError()
+						errChan <- err
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// runLocalReader handles reading data from the local connection and sending to WebSocket.
+func (t *IAPTunnel) runLocalReader(ctx context.Context, ws *websocket.Conn, reader io.Reader, errChan chan<- error, cancel context.CancelFunc, connID string) {
+	defer func() {
+		log.V(3).Infof("Local reader goroutine exiting for %s", connID)
+		cancel()
+		errChan <- nil
+	}()
+
+	buffer := make([]byte, maxFrameSize)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			n, err := reader.Read(buffer)
+			if err == io.EOF {
+				log.V(2).Infof("Local connection %s closed (EOF)", connID)
+				return
+			}
+			if err != nil {
+				if isTimeoutError(err) {
+					continue
+				}
+				log.Errorf("Local read error for %s: %v", connID, err)
+				t.stats.addLocalError()
+				errChan <- err
+				return
+			}
+
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buffer[:n])
+
+				frame := t.createSubprotocolDataFrame(data)
+				ws.SetWriteDeadline(time.Now().Add(writeTimeout))
+
+				if err := ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					log.Errorf("WebSocket write error for %s: %v", connID, err)
+					t.stats.addWSError()
+					errChan <- err
+					return
+				}
+
+				t.stats.addSent(int64(n))
+				t.stats.updateActivity()
+				log.V(3).Infof("Sent %d bytes to WebSocket for %s", n, connID)
+			}
+		}
+	}
+}
+
+// runHealthMonitor monitors connection health and triggers reconnects if needed.
+func (t *IAPTunnel) runHealthMonitor(ctx context.Context, errChan chan<- error, connID string) {
+	defer func() { errChan <- nil }()
+
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			t.stats.addHealthCheck()
+
+			timeSinceActivity := time.Since(t.stats.lastActivity)
+			if timeSinceActivity > maxIdleTime {
+				log.Warningf("Connection %s idle for %v, forcing reconnect", connID, timeSinceActivity)
+				t.stats.addIdleTimeout()
+				errChan <- fmt.Errorf("idle timeout after %v", timeSinceActivity)
+				return
+			}
+
+			log.V(3).Infof("Health check for %s: last activity %v ago", connID, timeSinceActivity)
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// connectWebSocket establishes a WebSocket connection to the IAP tunnel endpoint.
 func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, error) {
-	// Use the comprehensive token refresh strategy
 	token, err := t.getValidToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get valid token: %w", err)
@@ -879,33 +798,29 @@ func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, erro
 	params.Set("zone", t.config.Zone)
 	params.Set("instance", t.config.Instance)
 	params.Set("interface", "nic0")
-	params.Set("_", fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())) // Cache buster with randomness
+	params.Set("_", fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63()))
 
 	wsURL := fmt.Sprintf("%s?%s", iapTunnelEndpoint, params.Encode())
 
-	// Headers with fresh token
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+token.AccessToken)
 	headers.Set("User-Agent", "google-cloud-sdk gcloud/go-iap-tunnel")
 	headers.Set("Origin", tunnelOrigin)
 
-	// Log token info for debugging
-	t.logDebug("Using token that expires at: %v (in %v)",
-		token.Expiry, time.Until(token.Expiry))
+	log.V(2).Infof("Using token that expires at: %v (in %v)", token.Expiry, time.Until(token.Expiry))
 
-	// WebSocket dialer configuration - conservative settings
 	dialer := websocket.Dialer{
 		HandshakeTimeout:  connectionTimeout,
 		Subprotocols:      []string{subprotocolName},
 		ReadBufferSize:    readBufferSize,
 		WriteBufferSize:   writeBufferSize,
-		EnableCompression: false, // Disable compression for better performance
+		EnableCompression: false,
 		TLSClientConfig: &tls.Config{
 			ServerName: "tunnel.cloudproxy.app",
 		},
 	}
 
-	t.logDebug("Connecting to WebSocket: %s", wsURL)
+	log.V(1).Infof("Connecting to WebSocket: %s", wsURL)
 
 	ws, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
@@ -917,36 +832,18 @@ func (t *IAPTunnel) connectWebSocket(ctx context.Context) (*websocket.Conn, erro
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
 
-	// Set keep-alive ping interval
-	go func() {
-		ticker := time.NewTicker(30 * time.Second) // More frequent than C# version
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-					t.logError("Keep-alive ping failed: %v", err)
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	// Handle pong responses
 	ws.SetPongHandler(func(appData string) error {
-		t.logDebug("Received pong")
+		log.V(3).Info("Received pong")
 		return nil
 	})
 
 	t.stats.addWSConnection()
-
-	t.logDebug("WebSocket connected successfully")
+	log.V(1).Info("WebSocket connected successfully")
 	return ws, nil
 }
 
+// extractDataFromWebSocketMessage parses IAP subprotocol messages and extracts data payload.
 func (t *IAPTunnel) extractDataFromWebSocketMessage(data []byte) []byte {
 	if len(data) < 2 {
 		return nil
@@ -956,7 +853,7 @@ func (t *IAPTunnel) extractDataFromWebSocketMessage(data []byte) []byte {
 	payload := data[2:]
 
 	switch tag {
-	case SUBPROTOCOL_TAG_DATA:
+	case subprotocolTagData:
 		if len(payload) < 4 {
 			return nil
 		}
@@ -964,11 +861,9 @@ func (t *IAPTunnel) extractDataFromWebSocketMessage(data []byte) []byte {
 		if len(payload) < int(4+dataLen) {
 			return nil
 		}
-		actualData := payload[4 : 4+dataLen]
-		atomic.AddInt64(&t.totalBytesReceived, int64(len(actualData)))
-		return actualData
+		return payload[4 : 4+dataLen]
 
-	case SUBPROTOCOL_TAG_CONNECT_SUCCESS_SID:
+	case subprotocolTagConnectSuccessSID:
 		if len(payload) < 4 {
 			return nil
 		}
@@ -977,37 +872,39 @@ func (t *IAPTunnel) extractDataFromWebSocketMessage(data []byte) []byte {
 			return nil
 		}
 		sidData := payload[4 : 4+sidLen]
-		t.connectionSid = string(sidData)
+		t.connectionSID = string(sidData)
 		t.setConnected(true)
-		t.logDebug("Connection established with SID: %s", t.connectionSid)
+		log.V(1).Infof("Connection established with SID: %s", t.connectionSID)
 		return nil
 
-	case SUBPROTOCOL_TAG_RECONNECT_SUCCESS_ACK:
+	case subprotocolTagReconnectSuccessACK:
 		t.setConnected(true)
-		t.logDebug("Reconnection successful")
+		log.V(1).Info("Reconnection successful")
 		return nil
 
-	case SUBPROTOCOL_TAG_ACK:
-		if t.config.Verbosity == "debug" && len(payload) >= 8 {
+	case subprotocolTagACK:
+		if log.V(3) && len(payload) >= 8 {
 			ackBytes := binary.BigEndian.Uint64(payload[0:8])
-			t.logDebug("Received ACK: %d bytes", ackBytes)
+			log.V(3).Infof("Received ACK: %d bytes", ackBytes)
 		}
 		return nil
 
 	default:
-		t.logDebug("Unknown subprotocol tag: 0x%04x", tag)
+		log.V(2).Infof("Unknown subprotocol tag: 0x%04x", tag)
 		return nil
 	}
 }
 
+// createSubprotocolDataFrame creates an IAP subprotocol data frame.
 func (t *IAPTunnel) createSubprotocolDataFrame(data []byte) []byte {
 	frame := make([]byte, 6+len(data))
-	binary.BigEndian.PutUint16(frame[0:2], SUBPROTOCOL_TAG_DATA)
+	binary.BigEndian.PutUint16(frame[0:2], subprotocolTagData)
 	binary.BigEndian.PutUint32(frame[2:6], uint32(len(data)))
 	copy(frame[6:], data)
 	return frame
 }
 
+// getValidToken returns a valid OAuth2 token, refreshing if necessary.
 func (t *IAPTunnel) getValidToken(ctx context.Context) (*oauth2.Token, error) {
 	t.tokenMutex.RLock()
 	currentToken := t.currentToken
@@ -1017,7 +914,6 @@ func (t *IAPTunnel) getValidToken(ctx context.Context) (*oauth2.Token, error) {
 	now := time.Now()
 	tokenAge := now.Sub(lastTokenTime)
 
-	// Check multiple conditions for token refresh
 	shouldRefresh := false
 	refreshReason := ""
 
@@ -1031,7 +927,6 @@ func (t *IAPTunnel) getValidToken(ctx context.Context) (*oauth2.Token, error) {
 		shouldRefresh = true
 		refreshReason = "token too old"
 	} else if tokenAge > proactiveTokenRefreshInterval {
-		// Add jitter to prevent all connections refreshing simultaneously
 		jitter := time.Duration(rand.Int63n(int64(tokenRefreshJitter)))
 		if tokenAge > proactiveTokenRefreshInterval+jitter {
 			shouldRefresh = true
@@ -1046,23 +941,22 @@ func (t *IAPTunnel) getValidToken(ctx context.Context) (*oauth2.Token, error) {
 	return currentToken, nil
 }
 
+// refreshToken obtains a fresh OAuth2 token from the token source.
 func (t *IAPTunnel) refreshToken(ctx context.Context, reason string) (*oauth2.Token, error) {
 	t.tokenMutex.Lock()
 	defer t.tokenMutex.Unlock()
 
 	// Double-check if another goroutine already refreshed
 	if reason == "proactive refresh" && time.Since(t.lastTokenTime) < proactiveTokenRefreshInterval {
-		t.logDebug("Token was already refreshed by another goroutine")
+		log.V(2).Info("Token was already refreshed by another goroutine")
 		return t.currentToken, nil
 	}
 
-	t.logDebug("Refreshing token: %s", reason)
+	log.V(1).Infof("Refreshing token: %s", reason)
 
-	// Get fresh token with timeout
 	tokenCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Create a new token source to force refresh
 	freshTokenSource, err := google.DefaultTokenSource(tokenCtx, iapScope)
 	if err != nil {
 		t.stats.addTokenError()
@@ -1075,7 +969,6 @@ func (t *IAPTunnel) refreshToken(ctx context.Context, reason string) (*oauth2.To
 		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
-	// Validate token
 	if newToken.AccessToken == "" {
 		t.stats.addTokenError()
 		return nil, fmt.Errorf("received empty access token")
@@ -1096,52 +989,41 @@ func (t *IAPTunnel) refreshToken(ctx context.Context, reason string) (*oauth2.To
 		t.stats.addTokenRefresh()
 	}
 
-	t.logDebug("Token refreshed successfully, expires: %v", newToken.Expiry)
+	log.V(1).Infof("Token refreshed successfully, expires: %v", newToken.Expiry)
 	return newToken, nil
 }
 
-func (t *IAPTunnel) Start(ctx context.Context) error {
-	// Start proactive token refresh service
-	go t.runTokenRefreshService(ctx)
-
-	if t.config.ListenOnStdin {
-		return t.startStdinTunnel(ctx)
-	} else {
-		return t.startPortTunnel(ctx)
-	}
-}
-
+// runTokenRefreshService proactively refreshes tokens to avoid expiry.
 func (t *IAPTunnel) runTokenRefreshService(ctx context.Context) {
-	// Add jitter to initial refresh to spread load
 	initialDelay := proactiveTokenRefreshInterval + time.Duration(rand.Int63n(int64(tokenRefreshJitter)))
 	ticker := time.NewTicker(initialDelay)
 	defer ticker.Stop()
 
-	t.logDebug("Started proactive token refresh service (interval: %v)", proactiveTokenRefreshInterval)
+	log.V(1).Infof("Started proactive token refresh service (interval: %v)", proactiveTokenRefreshInterval)
 
 	for {
 		select {
 		case <-ticker.C:
-			// Reset ticker to regular interval after first run
 			ticker.Reset(proactiveTokenRefreshInterval)
 
 			if _, err := t.getValidToken(ctx); err != nil {
-				t.logError("Proactive token refresh failed: %v", err)
-				// Retry sooner on errors
+				log.Errorf("Proactive token refresh failed: %v", err)
 				ticker.Reset(tokenErrorRetryInterval)
 			}
 
 		case <-ctx.Done():
-			t.logDebug("Token refresh service stopped")
+			log.V(1).Info("Token refresh service stopped")
 			return
 		}
 	}
 }
 
+// dumpStats outputs comprehensive tunnel statistics.
 func (t *IAPTunnel) dumpStats() {
 	uptime := time.Since(t.stats.startTime)
 	received := atomic.LoadInt64(&t.stats.bytesReceived)
 	sent := atomic.LoadInt64(&t.stats.bytesSent)
+	totalReceived := atomic.LoadInt64(&t.totalBytesReceived)
 	connections := atomic.LoadInt64(&t.stats.connections)
 	reconnects := atomic.LoadInt64(&t.stats.reconnects)
 	tokenRefreshes := atomic.LoadInt64(&t.stats.tokenRefreshes)
@@ -1151,7 +1033,13 @@ func (t *IAPTunnel) dumpStats() {
 	healthChecks := atomic.LoadInt64(&t.stats.healthChecks)
 	idleTimeouts := atomic.LoadInt64(&t.stats.idleTimeouts)
 
-	// Create a single buffer for all output to avoid interleaving
+	// Count active connections
+	activeConns := 0
+	t.activeConnections.Range(func(key, value interface{}) bool {
+		activeConns++
+		return true
+	})
+
 	var buf strings.Builder
 
 	buf.WriteString("\n=== IAP Tunnel Statistics ===\n")
@@ -1160,9 +1048,10 @@ func (t *IAPTunnel) dumpStats() {
 	buf.WriteString(fmt.Sprintf("  Started: %s\n", t.stats.startTime.Format("2006-01-02 15:04:05")))
 
 	buf.WriteString(fmt.Sprintf("\nData Transfer:\n"))
-	buf.WriteString(fmt.Sprintf("  Bytes received: %d (%.2f MB)\n", received, float64(received)/(1024*1024)))
-	buf.WriteString(fmt.Sprintf("  Bytes sent: %d (%.2f MB)\n", sent, float64(sent)/(1024*1024)))
-	buf.WriteString(fmt.Sprintf("  Total bytes: %d (%.2f MB)\n", received+sent, float64(received+sent)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Current session received: %d (%.2f MB)\n", received, float64(received)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Current session sent: %d (%.2f MB)\n", sent, float64(sent)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Total bytes received (all sessions): %d (%.2f MB)\n", totalReceived, float64(totalReceived)/(1024*1024)))
+	buf.WriteString(fmt.Sprintf("  Session total: %d (%.2f MB)\n", received+sent, float64(received+sent)/(1024*1024)))
 
 	if uptime.Seconds() > 0 {
 		buf.WriteString(fmt.Sprintf("  Avg throughput: %.2f KB/s in, %.2f KB/s out\n",
@@ -1171,7 +1060,8 @@ func (t *IAPTunnel) dumpStats() {
 	}
 
 	buf.WriteString(fmt.Sprintf("\nConnections:\n"))
-	buf.WriteString(fmt.Sprintf("  Local connections: %d\n", connections))
+	buf.WriteString(fmt.Sprintf("  Total local connections: %d\n", connections))
+	buf.WriteString(fmt.Sprintf("  Active connections: %d\n", activeConns))
 	buf.WriteString(fmt.Sprintf("  WebSocket connections: %d\n", wsConnections))
 	buf.WriteString(fmt.Sprintf("  Reconnects: %d\n", reconnects))
 	if !t.stats.lastReconnect.IsZero() {
@@ -1192,7 +1082,6 @@ func (t *IAPTunnel) dumpStats() {
 	buf.WriteString(fmt.Sprintf("  WebSocket errors: %d\n", wsErrors))
 	buf.WriteString(fmt.Sprintf("  Local connection errors: %d\n", localErrors))
 
-	// Connection quality metrics
 	if wsConnections > 0 {
 		errorRate := float64(wsErrors) / float64(wsConnections) * 100
 		buf.WriteString(fmt.Sprintf("  WebSocket error rate: %.1f%%\n", errorRate))
@@ -1214,13 +1103,18 @@ func (t *IAPTunnel) dumpStats() {
 
 	buf.WriteString("=============================\n\n")
 
-	// Write everything at once to avoid interleaving with shell output
-	t.logInfo("SIGUSR1 Stats Dump:\n%s", buf.String())
+	log.Infof("SIGUSR1 Stats Dump:\n%s", buf.String())
 
-	// Force flush stderr
-	os.Stderr.Sync()
+	// Also write to additional log file if specified
+	if t.config.LogFile != "" {
+		if f, err := os.OpenFile(t.config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			f.WriteString(fmt.Sprintf("[%s] %s", time.Now().Format("2006-01-02 15:04:05"), buf.String()))
+			f.Close()
+		}
+	}
 }
 
+// isExpectedCloseError checks if a WebSocket close error is expected during normal operation.
 func isExpectedCloseError(err error) bool {
 	return websocket.IsCloseError(err,
 		websocket.CloseNormalClosure,
@@ -1232,6 +1126,7 @@ func isExpectedCloseError(err error) bool {
 	)
 }
 
+// isTimeoutError checks if an error is a network timeout.
 func isTimeoutError(err error) bool {
 	if netErr, ok := err.(net.Error); ok {
 		return netErr.Timeout()
