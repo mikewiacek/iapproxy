@@ -71,13 +71,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -1262,26 +1260,4 @@ func parseFlags() (Config, error) {
 	}
 
 	return config, nil
-}
-
-// setupSignalHandlers configures graceful shutdown and stats dumping.
-func setupSignalHandlers(ctx context.Context, cancel context.CancelFunc, tunnel *Tunnel) {
-	sigChan := make(chan os.Signal, 1)
-	statsChan := make(chan os.Signal, 1)
-
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	signal.Notify(statsChan, syscall.SIGUSR1)
-
-	go func() {
-		<-sigChan
-		log.V(1).Info("Received shutdown signal")
-		cancel()
-	}()
-
-	go func() {
-		for {
-			<-statsChan
-			tunnel.DumpStats()
-		}
-	}()
 }
