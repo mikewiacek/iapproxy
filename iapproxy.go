@@ -126,6 +126,10 @@ const (
 	writeTimeout      = 10 * time.Second
 	readTimeout       = 60 * time.Second
 
+	// WebSocket keepalive settings
+	websocketPingInterval = 30 * time.Second // WebSocket ping interval to prevent idle connection drops
+	websocketPingTimeout  = 10 * time.Second // Timeout for ping response
+
 	// Token management
 	tokenRefreshBuffer            = 5 * time.Minute
 	proactiveTokenRefreshInterval = 20 * time.Minute
@@ -553,7 +557,36 @@ func (t *Tunnel) relayData(ctx context.Context, ws *websocket.Conn, reader io.Re
 
 	log.V(2).Infof("Starting relay for connection %s", connID)
 
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 3) // Buffered for 3 goroutines: reader, writer, and keepalive
+
+	// WebSocket keepalive goroutine - sends periodic pings to prevent idle connection drops
+	go func() {
+		ticker := time.NewTicker(websocketPingInterval)
+		defer ticker.Stop()
+		defer func() {
+			errChan <- nil
+		}()
+
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(relayCtx, websocketPingTimeout)
+				err := ws.Ping(pingCtx)
+				cancel()
+
+				if err != nil {
+					if !isExpectedCloseError(err) {
+						log.V(3).Infof("WebSocket ping error for %s: %v", connID, err)
+						t.stats.incWSErrors()
+					}
+					return
+				}
+				log.V(3).Infof("Sent WebSocket ping for connection %s", connID)
+			}
+		}
+	}()
 
 	// WebSocket reader goroutine - processes incoming frames
 	go func() {
@@ -681,10 +714,12 @@ func (t *Tunnel) relayData(ctx context.Context, ws *websocket.Conn, reader io.Re
 	// Wait for first goroutine to complete
 	select {
 	case err := <-errChan:
-		// Wait briefly for other goroutine to finish
-		select {
-		case <-errChan:
-		case <-time.After(50 * time.Millisecond):
+		// Wait briefly for other goroutines to finish
+		for i := 0; i < 2; i++ {
+			select {
+			case <-errChan:
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 		return err
 	case <-relayCtx.Done():
@@ -757,10 +792,10 @@ func (t *Tunnel) readWebSocket(ctx context.Context, ws *websocket.Conn) (websock
 		return 0, nil, err
 	}
 
-	readerCtx, cancel := context.WithTimeout(ctx, readTimeout)
-	defer cancel()
-
-	return ws.Read(readerCtx)
+	// Don't use a read timeout here - the reader must be able to continuously
+	// read to process control frames (like PONG responses to our PING keepalives).
+	// The coder/websocket library requires an active Reader to process pongs.
+	return ws.Read(ctx)
 }
 
 // writeWebSocket performs a thread-safe WebSocket write operation using the
