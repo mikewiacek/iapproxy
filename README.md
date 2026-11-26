@@ -14,13 +14,13 @@ The standard `gcloud compute start-iap-tunnel` command can suffer from performan
 
 - **Drop-in Replacement**: Fully compatible with existing SSH workflows and configurations
 
-- **Better Reliability**: Automatic reconnection, proactive token refresh, and robust error handling
+- **Better Reliability**: Per-session tunnel state, port-mode retry, proactive token refresh, and robust error handling
 
 ## Protocol Implementation
 
 This tool implements Google's IAP WebSocket relay protocol v4 with the following optimizations:
 
-- **Single Reader/Writer Pattern**: Prevents protocol violations through semaphore coordination
+- **Per-session Flow Control**: Isolates ACK counters and WebSocket write coordination for each tunnel
 
 - **Adaptive ACK Strategy**: Sends acknowledgments during writes (like Google's C# implementation) plus 1MB safety threshold
 
@@ -32,7 +32,7 @@ This tool implements Google's IAP WebSocket relay protocol v4 with the following
 
 ### Prerequisites
 
-- Go 1.19 or later
+- Go 1.24 or later
 - Google Cloud SDK (`gcloud`) installed and authenticated
 - Proper IAP permissions for your GCP project
 
@@ -41,8 +41,7 @@ This tool implements Google's IAP WebSocket relay protocol v4 with the following
 ```bash
 git clone https://github.com/mikewiacek/iapproxy.git
 cd iapproxy
-go mod tidy
-go build -o iapproxy
+go build -o iapproxy .
 ```
 
 ### Install Binary
@@ -129,6 +128,16 @@ ssh -p 2222 user@localhost
 | `--log-file` | Log file path | |
 | `-v` | Verbose logging level (1-3) | |
 
+### Logging
+
+The proxy logs startup, listener address, local connections, IAP tunnel establishment, retries, and failures at the default level. Logs are mirrored to stderr by default (and may also be written to glog's log files). Use `-v=2` for periodic statistics and protocol diagnostics, or `-v=3` for frame and keepalive details:
+
+```bash
+iapproxy -v=2 --project=my-project --zone=us-central1-a my-instance 22
+```
+
+Use `--alsologtostderr=false` to disable stderr mirroring. In `--listen-on-stdin` mode, diagnostics go to stderr; standard output is reserved for tunneled data.
+
 ## Performance Features
 
 ### Adaptive Flow Control
@@ -141,11 +150,12 @@ ssh -p 2222 user@localhost
 
 ### Connection Management
 
-- **Automatic Reconnection**: Seamless recovery from network interruptions
+- **Port-mode Retry**: Re-establishes the WebSocket after a transient failure; an interrupted application stream may still need to reconnect
+- **Stdin-mode Failure Handling**: Exits on an established tunnel failure instead of reusing already-consumed SSH input
 
 - **Proactive Token Refresh**: Prevents authentication interruptions
 
-- **Single Reader/Writer**: Enforces protocol compliance to prevent server errors
+- **Isolated Tunnel Sessions**: Prevents concurrent or subsequent local connections from sharing protocol state
 
 ### Monitoring
 
@@ -266,8 +276,9 @@ If you experience slow performance:
 ### Building
 
 ```bash
-go mod tidy
-go build -o iapproxy
+go test ./...
+go vet ./...
+go build -o iapproxy .
 ```
 
 ### Contributing

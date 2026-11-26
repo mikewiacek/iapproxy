@@ -2,12 +2,24 @@
 
 package main
 
-import "context"
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+)
 
 func setupSignalHandlers(ctx context.Context, cancel context.CancelFunc, tunnel *Tunnel) {
-    // Windows doesn’t support SIGUSR1, so just handle shutdown.
-    go func() {
-        <-ctx.Done()
-    }()
-}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
 
+	go func() {
+		defer signal.Stop(sigChan)
+		select {
+		case <-ctx.Done():
+		case <-sigChan:
+			log.Println("Received shutdown signal")
+			cancel()
+		}
+	}()
+}
